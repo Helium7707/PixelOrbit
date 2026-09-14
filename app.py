@@ -271,12 +271,45 @@ def render_strip_viewer(thumb: np.ndarray, label: str, container_height: int = 4
 
 @st.cache_data
 def cached_get_crater_patch(xml_path: str, center_r: int, center_c: int, patch_size: int = 300) -> np.ndarray:
-    meta = parse_pds4_metadata(xml_path)
-    r0 = max(0, center_r - patch_size // 2)
-    r1 = min(meta['lines'], r0 + patch_size)
-    c0 = max(0, center_c - patch_size // 2)
-    c1 = min(meta['samples'], c0 + patch_size)
-    crop = load_pds4_window(meta['img_path'], r0, r1, c0, c1, meta['samples'], meta['dtype'], offset=meta.get('offset', 0))
+    meta = {}
+    if xml_path and os.path.exists(xml_path):
+        try:
+            meta = parse_pds4_metadata(xml_path)
+        except Exception:
+            meta = {}
+    
+    img_path = meta.get('img_path')
+    if img_path and os.path.exists(img_path):
+        r0 = max(0, center_r - patch_size // 2)
+        r1 = min(meta.get('lines', r0 + patch_size), r0 + patch_size)
+        c0 = max(0, center_c - patch_size // 2)
+        c1 = min(meta.get('samples', c0 + patch_size), c0 + patch_size)
+        crop = load_pds4_window(img_path, r0, r1, c0, c1, meta['samples'], meta['dtype'], offset=meta.get('offset', 0))
+    else:
+        # Cloud deployment fallback: load high-resolution crop from results_demo
+        p_demo = os.path.join(ROOT, "results_demo", "ohrc_crop.png")
+        if not os.path.exists(p_demo):
+            p_demo = os.path.join(ROOT, "results_demo", "fused.png")
+        if os.path.exists(p_demo):
+            base_img = cv2.imread(p_demo, cv2.IMREAD_GRAYSCALE)
+        else:
+            base_img = np.zeros((patch_size, patch_size), dtype=np.uint8)
+        
+        hb, wb = base_img.shape[:2]
+        lines = meta.get('lines', 100000)
+        samples = meta.get('samples', 12000)
+        norm_r = center_r / max(1, lines) if center_r > hb else center_r / max(1, hb)
+        norm_c = center_c / max(1, samples) if center_c > wb else center_c / max(1, wb)
+        cr = int(norm_r * hb)
+        cc = int(norm_c * wb)
+        r0 = max(0, min(hb - patch_size, cr - patch_size // 2))
+        r1 = r0 + patch_size
+        c0 = max(0, min(wb - patch_size, cc - patch_size // 2))
+        c1 = c0 + patch_size
+        crop = base_img[max(0, r0):min(hb, r1), max(0, c0):min(wb, c1)]
+        if crop.shape[0] != patch_size or crop.shape[1] != patch_size:
+            crop = cv2.resize(crop, (patch_size, patch_size), interpolation=cv2.INTER_AREA)
+
     v = crop[crop > 0]
     if len(v) > 0:
         lo, hi = np.percentile(v, (1.0, 99.0))
@@ -2065,18 +2098,67 @@ elif sel == "3D Terrain":
             sfs_scale = st.slider("Photometric Slope Scale", 0.1, 1.0, 0.4, 0.05, help="Lunar-Lambert reflectance scaling parameter")
 
     try:
-        if st.session_state.pipeline_results and st.session_state.pipeline_results.get('is_custom'):
-            fused = st.session_state.pipeline_results['final_fused']
+        res = st.session_state.get('pipeline_results')
+        if res and res.get('is_custom'):
+            fused = res['final_fused']
             hf, wf = fused.shape[:2]
-            cy, cx = hf//2, wf//2; hs = min(180, hf//2, wf//2)
-            patch = fused[cy-hs:cy+hs, cx-hs:cx+hs]; feat_title = "Uploaded Terrain Surface"
+            cy, cx = hf // 2, wf // 2
+            hs = min(90, hf // 2, wf // 2)
+            patch = fused[cy - hs:cy + hs, cx - hs:cx + hs]
+            feat_title = "Uploaded Terrain Surface"
         else:
-            om = cached_parse_metadata(default_ohrc)
-            tm = cached_parse_metadata(default_tmc)
-            fp = compute_footprint(om, tm); ob = fp['ohrc_bbox']
-            cr_center = {"North Overlap Terraces": ob[0]+3500, "South Ejecta Pit": ob[1]-3500}.get(preset,(ob[0]+ob[1])//2)
-            patch = cached_get_crater_patch(default_ohrc, cr_center, (ob[2]+ob[3])//2, 180)
-            feat_title = preset
+            has_raw = False
+            if default_ohrc and os.path.exists(default_ohrc) and default_tmc and os.path.exists(default_tmc):
+                try:
+                    om = cached_parse_metadata(default_ohrc)
+                    tm = cached_parse_metadata(default_tmc)
+                    if om.get('img_path') and os.path.exists(om['img_path']):
+                        has_raw = True
+                except Exception:
+                    has_raw = False
+
+            if has_raw:
+                fp = compute_footprint(om, tm)
+                ob = fp['ohrc_bbox']
+                cr_center = {"North Overlap Terraces": ob[0] + 3500, "South Ejecta Pit": ob[1] - 3500}.get(preset, (ob[0] + ob[1]) // 2)
+                patch = cached_get_crater_patch(default_ohrc, cr_center, (ob[2] + ob[3]) // 2, 180)
+                feat_title = preset
+            else:
+                # Cloud deployment / demo mode: extract high-contrast patch directly from OHRC crop or fused demo
+                p_ohrc = os.path.join(ROOT, "results_demo", "ohrc_crop.png")
+                p_fused = os.path.join(ROOT, "results_demo", "fused.png")
+                source_img = None
+                if res and res.get('target_img') is not None:
+                    source_img = res['target_img']
+                elif os.path.exists(p_ohrc):
+                    source_img = cv2.imread(p_ohrc, cv2.IMREAD_GRAYSCALE)
+                elif res and res.get('final_fused') is not None:
+                    source_img = res['final_fused']
+                elif os.path.exists(p_fused):
+                    source_img = cv2.imread(p_fused, cv2.IMREAD_GRAYSCALE)
+
+                if source_img is None:
+                    source_img = np.zeros((360, 360), dtype=np.uint8)
+                    cv2.circle(source_img, (180, 180), 80, 180, -1)
+
+                hs = 90  # 180x180 patch (45m x 45m footprint at 0.25 m/px)
+                sh_h, sh_w = source_img.shape[:2]
+                preset_centers = {
+                    "North Overlap Terraces": (int(sh_h * 0.25), sh_w // 2),
+                    "South Ejecta Pit": (int(sh_h * 0.75), sh_w // 2),
+                    "Central Mare Basin & Rim": (sh_h // 2, sh_w // 2)
+                }
+                cy, cx = preset_centers.get(preset, (sh_h // 2, sh_w // 2))
+                r0 = max(0, min(sh_h - 2 * hs, cy - hs))
+                r1 = r0 + 2 * hs
+                c0 = max(0, min(sh_w - 2 * hs, cx - hs))
+                c1 = c0 + 2 * hs
+                patch = source_img[r0:r1, c0:c1].copy()
+                if patch.shape[0] != 180 or patch.shape[1] != 180:
+                    patch = cv2.resize(patch, (180, 180), interpolation=cv2.INTER_AREA)
+
+                patch = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(patch)
+                feat_title = preset
 
         ny, nx = patch.shape
         X = np.arange(nx) * 0.25
