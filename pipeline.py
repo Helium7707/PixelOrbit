@@ -372,17 +372,110 @@ def apply_clahe(img, clip_limit=2.0, grid_size=8) -> np.ndarray:
     clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(grid_size, grid_size))
     return clahe.apply(img)
 
+def build_scale_space_pyramid(img: np.ndarray, num_octaves: int = 5) -> List[np.ndarray]:
+    """Constructs a Gaussian scale-space image pyramid.
+    
+    Each octave applies an anti-aliasing Gaussian smoothing kernel followed by
+    dyadic (2x) sub-sampling, preserving low spatial frequencies while preventing
+    high-frequency aliasing and moiré artifacts.
+    """
+    pyramid = [img]
+    curr = img.astype(np.float32) if img.dtype != np.float32 else img.copy()
+    for _ in range(num_octaves):
+        if min(curr.shape[:2]) <= 16:
+            break
+        curr = cv2.pyrDown(curr)
+        pyramid.append(curr.astype(img.dtype) if img.dtype != np.float32 else curr.copy())
+    return pyramid
+
+def scale_space_downsample(
+    img: np.ndarray,
+    scale_factor: float = 20.0,
+    src_gsd: Optional[float] = None,
+    tgt_gsd: Optional[float] = None,
+) -> np.ndarray:
+    """Multi-octave Gaussian scale-space pyramid downsampler for multi-sensor lunar imagery.
+    
+    Dynamically bridges large resolution gaps (e.g. 20:1 between 0.25 m/px OHRC and 5.0 m/px TMC-2).
+    Instead of single-step decimation (which causes catastrophic high-frequency aliasing and
+    breaks Fourier phase correlation), this function:
+      1. Determines the exact continuous downsampling factor from resolution/GSD metadata:
+         scale_factor = tgt_gsd / src_gsd (e.g. 5.0 / 0.25 = 20.0).
+      2. Progressively applies octave Gaussian low-pass filtering and 2x sub-sampling
+         (cv2.pyrDown) while the remaining factor >= 2.0.
+      3. For the remaining fractional factor s in [1.0, 2.0), applies a matched scale-space
+         Gaussian filter (sigma = sqrt(max(0.01, s^2 - 1.0)) * 0.85) and area-weighted
+         interpolation (cv2.INTER_AREA) to the exact target pixel dimensions.
+    
+    Ensures input features are low-pass filtered to the Nyquist limit of the reference sensor
+    grid, enabling robust Fourier phase correlation and dense matching across all swath segments.
+    """
+    if src_gsd is not None and tgt_gsd is not None and src_gsd > 0:
+        scale_factor = float(tgt_gsd) / float(src_gsd)
+    
+    # If scale_factor is given as a fraction < 1.0 (e.g. 0.05 = 1/20), invert it
+    if 0.0 < scale_factor < 1.0:
+        scale_factor = 1.0 / scale_factor
+        
+    if scale_factor <= 1.001 or img is None or img.size == 0:
+        return img
+
+    orig_dtype = img.dtype
+    curr = img.astype(np.float32) if orig_dtype != np.float32 else img.copy()
+    remaining = float(scale_factor)
+    
+    # Octave scale-space reductions
+    while remaining >= 2.0 and min(curr.shape[:2]) > 16:
+        curr = cv2.pyrDown(curr)
+        remaining /= 2.0
+        
+    # Fractional reduction to exact target dimensions
+    target_w = max(16, int(round(img.shape[1] / scale_factor)))
+    target_h = max(16, int(round(img.shape[0] / scale_factor)))
+    
+    if curr.shape[1] != target_w or curr.shape[0] != target_h:
+        if remaining > 1.001:
+            sigma = float(np.sqrt(max(0.01, remaining**2 - 1.0))) * 0.85
+            curr = cv2.GaussianBlur(curr, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        curr = cv2.resize(curr, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        
+    if orig_dtype == np.uint8:
+        return np.clip(curr, 0, 255).astype(np.uint8)
+    elif orig_dtype == np.uint16:
+        return np.clip(curr, 0, 65535).astype(np.uint16)
+    return curr
+
 def gaussian_downsample(img, scale) -> np.ndarray:
+    """Scale-space Gaussian downsampler."""
     if scale >= 1.0:
         return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    sigma = max(0.8, 0.5 / scale)
-    blurred = cv2.GaussianBlur(img, (0, 0), sigmaX=sigma, sigmaY=sigma)
-    new_w = max(32, int(round(img.shape[1] * scale)))
-    new_h = max(32, int(round(img.shape[0] * scale)))
-    return cv2.resize(blurred, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return scale_space_downsample(img, scale_factor=1.0 / scale)
 
-def prepare_images(ohrc_crop, tmc_crop, mode='phase_congruency') -> Tuple[np.ndarray, np.ndarray]:
-    ohrc_norm = normalize_percentile(ohrc_crop)
+def prepare_images(
+    ohrc_crop: np.ndarray,
+    tmc_crop: np.ndarray,
+    mode: str = 'phase_congruency',
+    src_gsd: Optional[float] = None,
+    tgt_gsd: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Illumination-invariant and scale-space normalized feature preprocessing.
+    
+    Dynamically checks and normalizes resolution mismatch between target and reference
+    images before extracting phase congruency or gradient feature maps.
+    """
+    # 1. Scale-space resolution normalization if resolution gap > 1.5x
+    if src_gsd is not None and tgt_gsd is not None and tgt_gsd > src_gsd * 1.5:
+        ohrc_scaled = scale_space_downsample(ohrc_crop, src_gsd=src_gsd, tgt_gsd=tgt_gsd)
+    else:
+        ho, wo = ohrc_crop.shape[:2]
+        ht, wt = tmc_crop.shape[:2]
+        if wo > wt * 5 or ho > ht * 5:
+            factor = max(float(wo) / max(1, wt), float(ho) / max(1, ht))
+            ohrc_scaled = scale_space_downsample(ohrc_crop, scale_factor=factor)
+        else:
+            ohrc_scaled = ohrc_crop
+
+    ohrc_norm = normalize_percentile(ohrc_scaled)
     tmc_norm = normalize_percentile(tmc_crop)
     
     if mode == 'phase_congruency':
@@ -396,7 +489,6 @@ def prepare_images(ohrc_crop, tmc_crop, mode='phase_congruency') -> Tuple[np.nda
         tmag = np.sqrt(tx**2 + ty**2)
         return normalize_percentile(omag), normalize_percentile(tmag)
     elif mode == 'legacy':
-        # Simple CLAHE for legacy
         return apply_clahe(ohrc_norm), apply_clahe(tmc_norm)
     else:
         return ohrc_norm, tmc_norm
@@ -405,30 +497,63 @@ def prepare_images(ohrc_crop, tmc_crop, mode='phase_congruency') -> Tuple[np.nda
 # COARSE ALIGNMENT SECTION
 # =============================================================================
 
-def coarse_to_fine_align(ohrc_prep, tmc_prep, thumb_size=512) -> dict:
-    """Two-stage autonomous coarse-to-fine alignment.
+def coarse_to_fine_align(
+    ohrc_prep: np.ndarray,
+    tmc_prep: np.ndarray,
+    thumb_size: int = 512,
+    src_gsd: Optional[float] = None,
+    tgt_gsd: Optional[float] = None,
+) -> dict:
+    """Two-stage autonomous coarse-to-fine alignment with scale-space normalization.
     
-    Stage 1: Resamples both images to a square thumbnail and uses Log-Polar
-    Fourier-Mellin transform to recover residual rotation and scale.
+    Stage 1: Bridges resolution gaps via multi-octave scale-space filtering,
+    resamples with aspect-ratio preservation, and uses Log-Polar Fourier-Mellin
+    transform with orbital flight-corridor constraints to recover rotation and scale.
     Stage 2: Derotates and centers the OHRC patch onto the TMC canvas, then
     performs sub-pixel phase correlation to refine translation (dx, dy).
     """
     print("[PIPELINE] Coarse alignment via Log-Polar Fourier-Mellin...")
+    
+    # Scale-space normalize if resolution gap is present
+    if src_gsd is not None and tgt_gsd is not None and tgt_gsd > src_gsd * 1.5:
+        ohrc_prep = scale_space_downsample(ohrc_prep, src_gsd=src_gsd, tgt_gsd=tgt_gsd)
+        
     ht, wt = tmc_prep.shape[:2]
     ho, wo = ohrc_prep.shape[:2]
 
-    # Thumbnail for fast, aspect-ratio-neutral Fourier-Mellin rotation/scale recovery
-    o_thumb = cv2.resize(ohrc_prep, (thumb_size, thumb_size), interpolation=cv2.INTER_AREA)
-    t_thumb = cv2.resize(tmc_prep, (thumb_size, thumb_size), interpolation=cv2.INTER_AREA)
+    # Aspect-preserving multi-scale thumbnail for Fourier-Mellin rotation/scale recovery
+    scale_o = float(thumb_size) / max(ho, wo)
+    scale_t = float(thumb_size) / max(ht, wt)
+    new_wo, new_ho = max(16, int(round(wo * scale_o))), max(16, int(round(ho * scale_o)))
+    new_wt, new_ht = max(16, int(round(wt * scale_t))), max(16, int(round(ht * scale_t)))
+    
+    # Common canvas size for Log-Polar Fourier-Mellin
+    common_dim = max(new_wo, new_ho, new_wt, new_ht, 256)
+    o_thumb = np.zeros((common_dim, common_dim), dtype=np.uint8)
+    t_thumb = np.zeros((common_dim, common_dim), dtype=np.uint8)
+    
+    o_res = cv2.resize(ohrc_prep, (new_wo, new_ho), interpolation=cv2.INTER_AREA)
+    t_res = cv2.resize(tmc_prep, (new_wt, new_ht), interpolation=cv2.INTER_AREA)
+    
+    o_thumb[:new_ho, :new_wo] = o_res
+    t_thumb[:new_ht, :new_wt] = t_res
     
     res = algorithms.log_polar_fourier_mellin(t_thumb, o_thumb)
-    rot = res.get('rotation_deg', 0.0)
-    scale = res.get('scale', 1.0)
-    print(f"[PIPELINE] Coarse FMT: rot={rot:.2f}°, scale={scale:.2f}")
+    raw_rot = res.get('rotation_deg', 0.0)
+    
+    # In Chandrayaan-2 lunar near-polar orbits, forward flight direction is within +/-30 deg.
+    # Discard 180-deg Hermitian symmetry ambiguity if present.
+    rot_cand = (raw_rot + 180.0) % 360.0 - 180.0
+    if abs(rot_cand) > 45.0:
+        alt_rot = (rot_cand + 180.0) % 360.0 - 180.0
+        if abs(alt_rot) < abs(rot_cand):
+            rot_cand = alt_rot
+    rot = float(np.clip(rot_cand, -30.0, 30.0))
+    scale = float(np.clip(res.get('scale', 1.0), 0.85, 1.15))
+    print(f"[PIPELINE] Coarse FMT: rot={rot:.2f}°, scale={scale:.4f}")
     
     # Sub-pixel translation refinement on the TMC canvas
     M_rot = cv2.getRotationMatrix2D((wo / 2.0, ho / 2.0), rot, 1.0 / scale)
-    # Center OHRC inside the TMC canvas
     M_rot[0, 2] += (wt - wo) / 2.0
     M_rot[1, 2] += (ht - ho) / 2.0
     
@@ -1134,15 +1259,18 @@ def run_pipeline(ohrc_xml, tmc_xml, matchers=None, preprocessing='phase_congruen
     step = max(1, int(round(CURRENT_GSD['TMC-2'] / CURRENT_GSD['OHRC'])))
     ohrc_raw = load_pds4_decimated(o_meta['img_path'], oroi[0], oroi[1], oroi[2], oroi[3], o_meta['samples'], o_meta['dtype'], step, offset=o_meta.get('offset',0))
     
-    print("[PIPELINE] 3. GSD Normalization...")
+    print("[PIPELINE] 3. GSD Normalization via Scale-Space Pyramid...")
     target_w = max(32, int(round(ohrc_raw.shape[1] * o_meta['gsd'] / t_meta['gsd'])))
     target_h = max(32, int(round(ohrc_raw.shape[0] * step * o_meta['gsd'] / t_meta['gsd'])))
-    ohrc_crop = cv2.resize(ohrc_raw, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    factor = float(t_meta['gsd']) / float(o_meta['gsd'] * step)
+    ohrc_crop = scale_space_downsample(ohrc_raw, scale_factor=factor)
+    if ohrc_crop.shape[1] != target_w or ohrc_crop.shape[0] != target_h:
+        ohrc_crop = cv2.resize(ohrc_crop, (target_w, target_h), interpolation=cv2.INTER_AREA)
     print(f"[PIPELINE] Physical scale: TMC crop {tmc_crop.shape}, OHRC normalized {ohrc_crop.shape}")
     
     print("[PIPELINE] 4. Coarse alignment...")
-    ohrc_prep_coarse, tmc_prep_coarse = prepare_images(ohrc_crop, tmc_crop, mode=preprocessing)
-    coarse_res = coarse_to_fine_align(ohrc_prep_coarse, tmc_prep_coarse)
+    ohrc_prep_coarse, tmc_prep_coarse = prepare_images(ohrc_crop, tmc_crop, mode=preprocessing, src_gsd=t_meta['gsd'], tgt_gsd=t_meta['gsd'])
+    coarse_res = coarse_to_fine_align(ohrc_prep_coarse, tmc_prep_coarse, src_gsd=t_meta['gsd'], tgt_gsd=t_meta['gsd'])
     
     # Apply coarse alignment to ohrc onto tmc canvas
     ht, wt = tmc_crop.shape[:2]

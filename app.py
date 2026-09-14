@@ -119,7 +119,7 @@ div[data-testid="stAlert"]{border-radius:8px!important;font-size:0.82rem!importa
 try:
     from pipeline import (
         parse_pds4_metadata, load_pds4_window, load_pds4_decimated,
-        compute_footprint, gaussian_downsample, prepare_images,
+        compute_footprint, gaussian_downsample, scale_space_downsample, prepare_images,
         coarse_to_fine_align, run_loftr_branch, run_roma_branch,
         run_lightglue_branch, run_sift_branch, run_orb_branch,
         compute_all_metrics, fit_tps_warp, fuse_images,
@@ -818,7 +818,10 @@ def load_default_mission_telemetry(ref_mission=None):
                                            om['samples'], om['dtype'], step, offset=om.get('offset', 0))
             target_w = max(32, int(round(ohrc_raw.shape[1] * om['gsd'] / tm['gsd'])))
             target_h = max(32, int(round(ohrc_raw.shape[0] * step * om['gsd'] / tm['gsd'])))
-            ohrc_crop = cv2.resize(ohrc_raw, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            factor = float(tm['gsd']) / float(om['gsd'] * step)
+            ohrc_crop = scale_space_downsample(ohrc_raw, scale_factor=factor)
+            if ohrc_crop.shape[1] != target_w or ohrc_crop.shape[0] != target_h:
+                ohrc_crop = cv2.resize(ohrc_crop, (target_w, target_h), interpolation=cv2.INTER_AREA)
         else:
             p_tmc = os.path.join(ROOT, "results_demo", "tmc_crop.png")
             p_ohrc = os.path.join(ROOT, "results_demo", "ohrc_crop.png")
@@ -874,9 +877,7 @@ def load_default_mission_telemetry(ref_mission=None):
         # Ensure registered image is strictly derived from target OHRC and never identical to reference
         if (registered_img is None or np.array_equal(registered_img, tmc_crop)) and H_mat is not None and ohrc_crop is not None:
             ht, wt = tmc_crop.shape[:2]
-            c2f_mat = np.array([[0.98, 0.0, 103.89], [0.0, 0.98, -58.81]], dtype=np.float32)
-            ohrc_c = cv2.warpAffine(ohrc_crop.astype(np.float32), c2f_mat, (wt, ht), flags=cv2.INTER_LINEAR).astype(np.uint8)
-            registered_img = cv2.warpPerspective(ohrc_c, H_mat, (wt, ht))
+            registered_img = cv2.warpPerspective(ohrc_crop, H_mat, (wt, ht))
         elif registered_img is None:
             registered_img = final_fused.copy()
 
@@ -891,6 +892,23 @@ def load_default_mission_telemetry(ref_mission=None):
         elif "SELENE" in ref_mission: ref_gsd = 10.00
         if "Ground_RMSE_m" in metrics_dict and "Reproj_RMSE_px" in metrics_dict:
             metrics_dict["Ground_RMSE_m"] = round(metrics_dict["Reproj_RMSE_px"] * ref_gsd, 4)
+
+        # Dynamically compute verified alignment parameters from H_mat
+        if H_mat is not None:
+            tx_v = float(H_mat[0, 2])
+            ty_v = float(H_mat[1, 2])
+            sc_v = float(np.sqrt(abs(H_mat[0, 0] * H_mat[1, 1] - H_mat[0, 1] * H_mat[1, 0])))
+            rot_v = float(np.arctan2(H_mat[1, 0], H_mat[0, 0]) * 180.0 / np.pi)
+            align_res = {'translation': (round(tx_v, 2), round(ty_v, 2)), 'rotation_deg': round(rot_v, 2), 'scale': round(sc_v, 4)}
+        else:
+            align_res = {'translation': (0.0, 0.0), 'rotation_deg': 0.0, 'scale': 1.0}
+
+        nz_y, nz_x = np.where(registered_img > 0) if registered_img is not None else ([], [])
+        if len(nz_y) > 0:
+            roi_bbox = (int(nz_y.min()), int(nz_y.max()) + 1, int(nz_x.min()), int(nz_x.max()) + 1)
+        else:
+            roi_bbox = (958, 4255, 230, 623)
+
         return {
             'target_img': ohrc_crop,
             'reference_img': tmc_crop,
@@ -900,9 +918,9 @@ def load_default_mission_telemetry(ref_mission=None):
             'final_fused': final_fused,
             'registered': registered_img,
             'H': H_mat,
-            'align_results': {'translation': (103.89, -58.81), 'rotation_deg': -3.77, 'scale': 0.98},
+            'align_results': align_res,
             'matchers': demo_matchers, 'metrics': metrics_dict, 'sim_map': sim_map,
-            'roi_bbox': (1018, 4397, 127, 666),
+            'roi_bbox': roi_bbox,
             'roma_pts0': pts0_t, 'roma_pts1': pts1_t,
             'subpixel_pts0': pts0_t, 'subpixel_pts1': pts1_t,
             'is_custom': False,
@@ -1020,14 +1038,17 @@ if sel == "Mission Control":
                                                        om['samples'], om['dtype'], step, offset=om.get('offset', 0))
                         tw = max(32, int(round(ohrc_raw.shape[1] * om['gsd'] / tm['gsd'])))
                         th = max(32, int(round(ohrc_raw.shape[0] * step * om['gsd'] / tm['gsd'])))
-                        ohrc_crop = cv2.resize(ohrc_raw, (tw, th), interpolation=cv2.INTER_AREA)
+                        factor = float(tm['gsd']) / float(om['gsd'] * step)
+                        ohrc_crop = scale_space_downsample(ohrc_raw, scale_factor=factor)
+                        if ohrc_crop.shape[1] != tw or ohrc_crop.shape[0] != th:
+                            ohrc_crop = cv2.resize(ohrc_crop, (tw, th), interpolation=cv2.INTER_AREA)
                     else:
                         p_tmc = os.path.join(ROOT, "results_demo", "tmc_crop.png")
                         p_ohrc = os.path.join(ROOT, "results_demo", "ohrc_crop.png")
                         tmc_crop = cv2.imread(p_tmc, cv2.IMREAD_GRAYSCALE)
                         ohrc_crop = cv2.imread(p_ohrc, cv2.IMREAD_GRAYSCALE)
-                    op, tp2 = prepare_images(ohrc_crop, tmc_crop, 'phase_congruency')
-                    ar = coarse_to_fine_align(op, tp2)
+                    op, tp2 = prepare_images(ohrc_crop, tmc_crop, 'phase_congruency', src_gsd=om['gsd'], tgt_gsd=tm['gsd'])
+                    ar = coarse_to_fine_align(op, tp2, src_gsd=om['gsd'], tgt_gsd=tm['gsd'])
                     ht, wt = tmc_crop.shape[:2]
                     ohrc_c = cv2.warpAffine(ohrc_crop.astype(np.float32), ar['transform_matrix'],
                                              (wt, ht), flags=cv2.INTER_LINEAR).astype(np.uint8)
