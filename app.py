@@ -2480,7 +2480,7 @@ elif sel == "Alignment Inspection":
 # VIEW 4: 3D TERRAIN
 # =============================================================================
 elif sel == "3D Terrain":
-    c1, c2, c3, c4 = st.columns([1.8, 1.4, 1.4, 1.0])
+    c1, c2, c3, c4, c5 = st.columns([1.6, 1.2, 1.2, 1.5, 0.8])
     with c1:
         preset = st.selectbox("Feature Preset", ["Central Mare Basin & Rim", "North Overlap Terraces", "South Ejecta Pit"],
                               label_visibility="collapsed")
@@ -2495,7 +2495,38 @@ elif sel == "3D Terrain":
         dem_mode = st.selectbox("Elevation (Z)", ["Lunar-Lambert SfS DEM", "Planar Datum (Z ≡ 0m)"],
                                 label_visibility="collapsed")
     with c4:
+        z_scope = st.selectbox(
+            "Topography Scope",
+            ["Crater Profile Transect (Recommended)", "Full DEM Surface Envelope"],
+            index=0,
+            label_visibility="collapsed",
+            help="Select whether ΔZ and Topography profile are calibrated to the local crater transect line or the full 2D DEM bounding envelope."
+        )
+    with c5:
         grid_lines = st.checkbox("Base Grid", value=True)
+
+    st.markdown(
+        f"""<div class="card card-s" style="margin-top:4px;margin-bottom:12px;padding:8px 14px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+            <div>
+              <span class="chip chip-s" style="font-size:0.62rem;">SPATIAL SCOPE</span>
+              <strong style="color:#dde3ed;font-size:0.78rem;margin-left:6px;">45m × 45m Local Patch (180×180 px @ 0.25 m/px OHRC)</strong>
+            </div>
+            <div>
+              <span class="chip chip-m" style="font-size:0.62rem;">PHOTOMETRIC MODEL</span>
+              <span style="color:#8896a8;font-size:0.75rem;margin-left:6px;">Lunar-Lambert SfS · Frankot-Chellappa Fourier Integration</span>
+            </div>
+            <div>
+              <span class="chip chip-a" style="font-size:0.62rem;">ELEVATION DATUM</span>
+              <span style="color:#10dba8;font-size:0.75rem;margin-left:6px;">Frankot-Chellappa Mean Datum (Z ≡ 0.0m)</span>
+            </div>
+            <div>
+              <span class="chip chip-p" style="font-size:0.62rem;">Z GROUND TRUTH</span>
+              <span style="color:#38bdf8;font-size:0.75rem;margin-left:6px;">{'Crater Profile Transect' if 'Transect' in z_scope else 'Full DEM Surface Envelope'}</span>
+            </div>
+          </div>
+        </div>""", unsafe_allow_html=True
+    )
 
     with st.expander("Photometric & Orbital Solar Geometry Controls", expanded=False):
         ec1, ec2, ec3 = st.columns(3)
@@ -2574,6 +2605,10 @@ elif sel == "3D Terrain":
         Y = np.arange(ny) * 0.25
 
         # 1. Scientific Digital Elevation Model (DEM) via Lunar-Lambert Photoclinometry
+        cy_m, cx_m = ny // 2, nx // 2
+        hw = min(40, cx_m - 1, nx - cx_m - 1)
+        dists, vals = extract_crater_profile(patch, (cx_m - hw, cy_m), (cx_m + hw, cy_m), hw * 2)
+
         if dem_mode == "Lunar-Lambert SfS DEM":
             Z = lunar_lambert_photoclinometry(
                 patch,
@@ -2583,14 +2618,47 @@ elif sel == "3D Terrain":
                 albedo_weight=sfs_scale,
                 smoothing_sigma=1.0
             )
+            dists_z, vals_z = extract_crater_profile(Z, (cx_m - hw, cy_m), (cx_m + hw, cy_m), hw * 2)
+
+            min_z_prof = float(vals_z.min())
+            max_z_prof = float(vals_z.max())
+            delta_z_prof = abs(max_z_prof - min_z_prof)
+
+            min_z_dem = float(Z.min())
+            max_z_dem = float(Z.max())
+            delta_z_dem = abs(max_z_dem - min_z_dem)
+
+            if "Transect" in z_scope:
+                # Mode A: Crater Profile Transect is ground truth (default)
+                # Dynamically calculate ΔZ in the header using abs(max_z - min_z)
+                plot_z_min = min_z_prof
+                plot_z_max = max_z_prof
+                active_delta_z = delta_z_prof
+                vals_z_plot = vals_z
+                z_scale_label = f"Topography (Z min: {plot_z_min:.1f}m, max: {plot_z_max:.1f}m · ΔZ = {active_delta_z:.1f}m)"
+            else:
+                # Mode B: Full DEM depth (17.6m) is ground truth
+                # Fix scaling on Topography chart so its Y-axis range accurately reflects the full DEM difference
+                plot_z_min = min_z_dem
+                plot_z_max = max_z_dem
+                active_delta_z = delta_z_dem
+                span_prof = max(1e-4, delta_z_prof)
+                vals_z_plot = (vals_z - min_z_prof) / span_prof * active_delta_z + plot_z_min
+                z_scale_label = f"Topography (Z min: {plot_z_min:.1f}m, max: {plot_z_max:.1f}m · ΔZ = {active_delta_z:.1f}m)"
+
             z_aspect = 0.25  # Scientifically proportioned to 45m x 45m footprint
-            z_title = f"Elevation Z (m) [{Z.min():.1f}m to {Z.max():.1f}m]"
-            terrain_heading = f"Lunar-Lambert 3D DEM · {feat_title} · {nx*0.25:.0f}m × {ny*0.25:.0f}m (ΔZ = {np.ptp(Z):.1f}m, d/D = {np.ptp(Z)/(nx*0.25):.2f})"
+            z_title = f"Elevation Z (m) [{plot_z_min:.1f}m to {plot_z_max:.1f}m · ΔZ={active_delta_z:.1f}m]"
+            d_over_D = active_delta_z / (nx * 0.25) if nx > 0 else 0.0
+            terrain_heading = f"Lunar-Lambert 3D DEM · {feat_title} · {nx*0.25:.0f}m × {ny*0.25:.0f}m (ΔZ = {active_delta_z:.1f}m, d/D = {d_over_D:.2f})"
         else:
             Z = np.zeros((ny, nx), dtype=np.float64)
+            dists_z, vals_z = extract_crater_profile(Z, (cx_m - hw, cy_m), (cx_m + hw, cy_m), hw * 2)
+            vals_z_plot = np.zeros_like(vals_z)
+            plot_z_min, plot_z_max, active_delta_z = 0.0, 0.0, 0.0
             z_aspect = 0.04
             z_title = "Elevation Z ≡ 0.0m"
             terrain_heading = f"Planar Surface Texture · {feat_title} · {nx*0.25:.0f}m × {ny*0.25:.0f}m (Z ≡ 0.0m)"
+            z_scale_label = "Topography (Z ≡ 0.0m · Planar Datum)"
 
         # 2. Image array mapped EXCLUSIVELY to surfacecolor
         # Decouples elevation from image texture: optical radiance drapes over the 3D DEM
@@ -2640,29 +2708,39 @@ elif sel == "3D Terrain":
             })
         with p2d:
             fig_patch = render_interactive_image(patch, f"2D Surface Context · {nx*0.25:.0f}m×{ny*0.25:.0f}m", height=230)
+            # Overlay transect cross-section line on 2D surface image
+            fig_patch.add_trace(go.Scatter(
+                x=[cx_m - hw, cx_m + hw],
+                y=[cy_m, cy_m],
+                mode="lines+markers",
+                line=dict(color="#10dba8", width=2, dash="dash"),
+                marker=dict(size=5, color="#10dba8"),
+                name="Transect Line",
+                hoverinfo="name"
+            ))
             st.plotly_chart(fig_patch, use_container_width=True, config={"scrollZoom": True})
-            cy_m, cx_m = ny//2, nx//2; hw = min(40, cx_m-1, nx-cx_m-1)
-            dists, vals = extract_crater_profile(patch, (cx_m-hw,cy_m), (cx_m+hw,cy_m), hw*2)
-            dists_z, vals_z = extract_crater_profile(Z, (cx_m-hw,cy_m), (cx_m+hw,cy_m), hw*2)
 
             fig_p, (ax1, ax2) = plt.subplots(2, 1, figsize=(4, 2.6), sharex=True)
             fig_p.patch.set_facecolor('#07090f')
             ax1.set_facecolor('#0c1018'); ax2.set_facecolor('#0c1018')
 
             # Topographic Elevation Profile
-            ax1.plot(dists_z*0.25, vals_z, color="#10dba8", linewidth=1.5)
-            ax1.fill_between(dists_z*0.25, vals_z, alpha=0.15, color="#10dba8")
-            ax1.set_title(f"Topography (Z min: {vals_z.min():.1f}m, max: {vals_z.max():.1f}m)", color="#8896a8", fontsize=8, pad=3)
+            ax1.plot(dists_z * 0.25, vals_z_plot, color="#10dba8", linewidth=1.5)
+            ax1.fill_between(dists_z * 0.25, vals_z_plot, alpha=0.15, color="#10dba8")
+            ax1.set_title(z_scale_label, color="#8896a8", fontsize=8, pad=3)
             ax1.set_ylabel("Z (m)", color="#4e5f72", fontsize=7)
+            if active_delta_z > 0:
+                y_pad = max(0.4, 0.1 * active_delta_z)
+                ax1.set_ylim(plot_z_min - y_pad, plot_z_max + y_pad)
             ax1.tick_params(colors="#4e5f72", labelsize=7)
             for sp in ax1.spines.values(): sp.set_color("#141e2c")
             ax1.grid(color="#141e2c", alpha=0.5, linewidth=0.5)
 
             # Optical Radiance Profile (Surface Albedo / Brightness)
-            ax2.plot(dists*0.25, vals, color="#00d4ff", linewidth=1.5)
-            ax2.fill_between(dists*0.25, vals, alpha=0.12, color="#00d4ff")
+            ax2.plot(dists * 0.25, vals, color="#00d4ff", linewidth=1.5)
+            ax2.fill_between(dists * 0.25, vals, alpha=0.12, color="#00d4ff")
             ax2.set_title("Optical Radiance (DN)", color="#8896a8", fontsize=8, pad=3)
-            ax2.set_xlabel("Distance (m)", color="#4e5f72", fontsize=8)
+            ax2.set_xlabel("Distance along Transect (m)", color="#4e5f72", fontsize=8)
             ax2.set_ylabel("DN", color="#4e5f72", fontsize=7)
             ax2.tick_params(colors="#4e5f72", labelsize=7)
             for sp in ax2.spines.values(): sp.set_color("#141e2c")
