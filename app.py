@@ -574,25 +574,33 @@ def render_interactive_image(
 
     return fig
 
-def render_comparison_slider(img_l, img_r, label_l="Reference", label_r="Registered", height=720, cid="cmp1", fit_mode="cover"):
+def render_comparison_slider(img_l, img_r, label_l="Reference", label_r="Registered", height=720, cid="cmp1", fit_mode="contain"):
     img_l_m, img_r_m = match_image_resolutions(img_l, img_r)
+    h_img, w_img = img_l_m.shape[:2]
+    aspect_str = f"{w_img} / {h_img}"
     b64l = img_to_b64(img_l_m, max_dim=1600)
     b64r = img_to_b64(img_r_m, max_dim=1600)
-    btn_text = "Fit Aspect" if fit_mode == "cover" else "Fill Width"
+    btn_text = "Fill Width" if fit_mode == "contain" else "Fit Height"
+    body_class = "mode-fit" if fit_mode == "contain" else "mode-fill"
     return (
         f'<!DOCTYPE html><html><head><meta charset="utf-8">'
         f'<style>'
         f'*{{box-sizing:border-box;margin:0;padding:0;user-select:none;-webkit-user-select:none;}}'
-        f'html,body{{width:100%;height:100%;overflow:hidden;background:#07090f;}}'
-        f'.cmp-box{{position:relative;width:100%;height:100%;overflow:hidden;background:#07090f;'
-        f'border-radius:10px;border:1px solid rgba(255,255,255,0.08);cursor:ew-resize;touch-action:none;}}'
-        f'.cmp-img{{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:{fit_mode};'
-        f'object-position:center center;pointer-events:none;transition:object-fit 0.2s;}}'
-        f'.cmp-over{{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:{fit_mode};'
-        f'object-position:center center;pointer-events:none;clip-path:polygon(0 0,50% 0,50% 100%,0 100%);will-change:clip-path;transition:object-fit 0.2s;}}'
+        f'html,body{{width:100%;height:100%;background:#07090f;font-family:\'JetBrains Mono\',monospace;}}'
+        f'body.mode-fit{{overflow:hidden;display:flex;align-items:center;justify-content:center;}}'
+        f'body.mode-fill{{overflow-y:auto;overflow-x:hidden;display:block;padding:10px 0;}}'
+        f'.cmp-box{{position:relative;aspect-ratio:{aspect_str};margin:0 auto;overflow:hidden;'
+        f'background:#07090f;border-radius:8px;border:1px solid rgba(255,255,255,0.12);'
+        f'box-shadow:0 4px 24px rgba(0,0,0,0.6);cursor:ew-resize;touch-action:none;}}'
+        f'body.mode-fit .cmp-box{{height:100%;max-height:100%;width:auto;max-width:100%;}}'
+        f'body.mode-fill .cmp-box{{width:100%;max-width:100%;height:auto;}}'
+        f'.cmp-img{{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:fill;'
+        f'pointer-events:none;}}'
+        f'.cmp-over{{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:fill;'
+        f'pointer-events:none;clip-path:polygon(0 0,50% 0,50% 100%,0 100%);will-change:clip-path;}}'
         f'.cmp-line{{position:absolute;top:0;bottom:0;left:50%;width:3px;background:#00d4ff;'
         f'box-shadow:0 0 14px rgba(0,212,255,0.8),0 0 28px rgba(0,212,255,0.4);transform:translateX(-50%);pointer-events:none;z-index:10;}}'
-        f'.cmp-knob{{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:38px;height:38px;'
+        f'.cmp-knob{{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:36px;height:36px;'
         f'border-radius:50%;background:#00d4ff;box-shadow:0 0 22px rgba(0,212,255,0.9);display:flex;'
         f'align-items:center;justify-content:center;pointer-events:auto;cursor:grab;}}'
         f'.cmp-knob:active{{cursor:grabbing;}}'
@@ -608,7 +616,7 @@ def render_comparison_slider(img_l, img_r, label_l="Reference", label_r="Registe
         f'.cmp-pct{{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);padding:3px 10px;'
         f'font-family:\'JetBrains Mono\',monospace;font-size:11px;background:rgba(7,9,15,0.88);'
         f'color:#8896a8;border:1px solid rgba(255,255,255,0.1);border-radius:5px;z-index:12;pointer-events:none;}}'
-        f'</style></head><body>'
+        f'</style></head><body class="{body_class}" id="bd_{cid}">'
         f'<div class="cmp-box" id="cw_{cid}">'
         f'<img src="{b64r}" class="cmp-img" id="img_r_{cid}" alt="Reference">'
         f'<img src="{b64l}" class="cmp-over" id="li_{cid}" alt="Registered">'
@@ -625,19 +633,24 @@ def render_comparison_slider(img_l, img_r, label_l="Reference", label_r="Registe
         f'<script>(function(){{'
         f'var cw=document.getElementById("cw_{cid}");'
         f'var li=document.getElementById("li_{cid}");'
-        f'var ir=document.getElementById("img_r_{cid}");'
         f'var hl=document.getElementById("hl_{cid}");'
         f'var pct=document.getElementById("pct_{cid}");'
         f'var tog=document.getElementById("tog_{cid}");'
-        f'var isCover = "{fit_mode}" === "cover";'
+        f'var bd=document.getElementById("bd_{cid}");'
+        f'var isFit=bd.classList.contains("mode-fit");'
         f'var drag=false;'
         f'tog.addEventListener("click",function(e){{'
         f'  e.stopPropagation();'
-        f'  isCover = !isCover;'
-        f'  var m = isCover ? "cover" : "contain";'
-        f'  li.style.objectFit = m;'
-        f'  ir.style.objectFit = m;'
-        f'  tog.textContent = isCover ? "Fit Aspect" : "Fill Width";'
+        f'  isFit=!isFit;'
+        f'  if(isFit){{'
+        f'    bd.classList.remove("mode-fill");'
+        f'    bd.classList.add("mode-fit");'
+        f'    tog.textContent="Fill Width";'
+        f'  }}else{{'
+        f'    bd.classList.remove("mode-fit");'
+        f'    bd.classList.add("mode-fill");'
+        f'    tog.textContent="Fit Height";'
+        f'  }}'
         f'}});'
         f'function update(cx){{'
         f'  var r=cw.getBoundingClientRect();'
@@ -1632,22 +1645,44 @@ elif sel == "Alignment Inspection":
                 st.markdown('<div style="font-size:0.75rem;color:#4e5f72;padding-top:8px;">R=Reference · G=Registered · B=Reference. Neutral gray = perfect alignment.</div>',
                             unsafe_allow_html=True)
 
+        # Determine active registered target bounding box
+        nz_y, nz_x = np.where(reg_img > 0)
+        if len(nz_y) > 0:
+            act_y0, act_y1 = int(nz_y.min()), int(nz_y.max()) + 1
+            act_x0, act_x1 = int(nz_x.min()), int(nz_x.max()) + 1
+        else:
+            act_y0, act_y1 = 0, reg_img.shape[0]
+            act_x0, act_x1 = 0, reg_img.shape[1]
+
+        h_act = max(1, act_y1 - act_y0)
+        w_act = max(1, act_x1 - act_x0)
+
+        # Global tie-point coordinates adjustment:
+        # If pts1 coordinates were saved in local tile frame (median y < act_y0 while reg_img has act_y0 > 1000),
+        # map them into global reference canvas coordinates
+        pts1_global = pts1_t.copy() if len(pts1_t) > 0 else np.empty((0, 2))
+        if len(pts1_global) > 0 and act_y0 > 1000 and np.median(pts1_global[:, 1]) < act_y0:
+            pts1_global[:, 1] += act_y0
+
         # If elongated pushbroom orbital strip (aspect ratio > 2.0), provide focus region & full width controls
         is_pushbroom = (ref_img.shape[0] / max(1, ref_img.shape[1]) > 2.0)
         y_offset = 0
-        
+        x_offset = 0
+
         if is_pushbroom:
-            reg_c1, reg_c2 = st.columns([2.0, 1.2])
+            reg_c1, reg_c2 = st.columns([2.2, 1.2])
             with reg_c1:
                 st.markdown('<p class="sec-label">Swath Inspection Framing</p>', unsafe_allow_html=True)
+                opt_overlap = "Active Registration Overlap (Recommended)"
+                opt_basin = f"Primary Crater Basin (Lines {act_y0:,}–{act_y0 + int(h_act * 0.33):,})"
+                opt_terraces = f"Central Crater Terraces (Lines {act_y0 + int(h_act * 0.33):,}–{act_y0 + int(h_act * 0.66):,})"
+                opt_ejecta = f"Southern Ejecta Field (Lines {act_y0 + int(h_act * 0.66):,}–{act_y1:,})"
+                opt_full = f"Full Mission Swath (Lines 0–{ref_img.shape[0]:,} Context)"
+
                 region_choice = st.radio(
                     "region",
-                    [
-                        "Primary Impact Basin (Lines 1,000-2,800)",
-                        "Northern Rim (Lines 0-1,600)",
-                        "Southern Terraces (Lines 2,600-4,200)",
-                        "Full Swath (All Lines)"
-                    ],
+                    [opt_overlap, opt_basin, opt_terraces, opt_ejecta, opt_full],
+                    index=0,
                     horizontal=True,
                     label_visibility="collapsed"
                 )
@@ -1655,38 +1690,52 @@ elif sel == "Alignment Inspection":
                 st.markdown('<p class="sec-label">Display Fit Mode</p>', unsafe_allow_html=True)
                 fit_choice = st.radio(
                     "fit",
-                    ["Fill Container (Full Width)", "Fit Aspect Ratio"],
+                    ["Fit Aspect Ratio", "Fill Width (Zoom Craters)"],
+                    index=0,
                     horizontal=True,
                     label_visibility="collapsed"
                 )
 
-            fit_mode = "cover" if "Fill" in fit_choice else "contain"
+            fit_mode = "contain" if "Fit Aspect" in fit_choice else "cover"
 
-            if "Primary" in region_choice:
-                ref_slice = ref_img[1000:2800, :]
-                reg_slice = reg_img[1000:2800, :]
-                y_offset = 1000
-            elif "Northern" in region_choice:
-                ref_slice = ref_img[0:1600, :]
-                reg_slice = reg_img[0:1600, :]
-                y_offset = 0
-            elif "Southern" in region_choice:
-                ref_slice = ref_img[2600:4200, :]
-                reg_slice = reg_img[2600:4200, :]
-                y_offset = 2600
+            if region_choice == opt_overlap:
+                ref_slice = ref_img[act_y0:act_y1, act_x0:act_x1]
+                reg_slice = reg_img[act_y0:act_y1, act_x0:act_x1]
+                y_offset = act_y0
+                x_offset = act_x0
+            elif "Primary" in region_choice:
+                y_end = act_y0 + int(h_act * 0.33)
+                ref_slice = ref_img[act_y0:y_end, act_x0:act_x1]
+                reg_slice = reg_img[act_y0:y_end, act_x0:act_x1]
+                y_offset = act_y0
+                x_offset = act_x0
+            elif "Terraces" in region_choice:
+                y_start = act_y0 + int(h_act * 0.33)
+                y_end = act_y0 + int(h_act * 0.66)
+                ref_slice = ref_img[y_start:y_end, act_x0:act_x1]
+                reg_slice = reg_img[y_start:y_end, act_x0:act_x1]
+                y_offset = y_start
+                x_offset = act_x0
+            elif "Ejecta" in region_choice:
+                y_start = act_y0 + int(h_act * 0.66)
+                ref_slice = ref_img[y_start:act_y1, act_x0:act_x1]
+                reg_slice = reg_img[y_start:act_y1, act_x0:act_x1]
+                y_offset = y_start
+                x_offset = act_x0
             else:
                 ref_slice = ref_img
                 reg_slice = reg_img
-                fit_mode = "cover"
                 y_offset = 0
+                x_offset = 0
         else:
             ref_slice = ref_img
             reg_slice = reg_img
-            fit_mode = "cover"
+            fit_mode = "contain"
             y_offset = 0
+            x_offset = 0
 
         is_lock_aspect = (fit_mode == "contain")
-        view_height = 720 if is_lock_aspect else 800
+        view_height = 800
 
         ref_m, reg_m = match_image_resolutions(ref_slice, reg_slice)
 
@@ -1717,7 +1766,7 @@ elif sel == "Alignment Inspection":
                 lock_aspect=is_lock_aspect
             )
             st.plotly_chart(fig_empty, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
-            st.info("Switch the Swath Inspection Framing selector to **'Southern Terraces (Lines 2,600–4,200)'** or **'Full Swath (All Lines)'** to view the active OHRC registration coverage.")
+            st.info("Switch the Swath Inspection Framing selector to **'Active Registration Overlap (Recommended)'** to view the active OHRC registration coverage.")
         else:
             # ── 2. ISOLATE VALID PIXELS FOR NORMALIZATION ─────────────────────
             # Create a boolean mask of valid data: valid_mask = warped_target > 0
@@ -1849,9 +1898,9 @@ elif sel == "Alignment Inspection":
                 # ── SUB-PIXEL INLIERS (TIE-POINTS) ──────────────────────────
                 visible_pts = []
                 visible_indices = []
-                if len(pts1_t) > 0:
-                    for idx, pt in enumerate(pts1_t):
-                        pt_x = float(pt[0])
+                if len(pts1_global) > 0:
+                    for idx, pt in enumerate(pts1_global):
+                        pt_x = float(pt[0] - x_offset)
                         pt_y = float(pt[1] - y_offset)
                         if 0 <= pt_x < disp_w.shape[1] and 0 <= pt_y < disp_w.shape[0]:
                             visible_pts.append((pt_x, pt_y))
@@ -1878,7 +1927,7 @@ elif sel == "Alignment Inspection":
                         text=[f"#{idx+1}" for idx in visible_indices],
                         textposition="top right",
                         textfont=dict(color="#38bdf8", size=10, family="JetBrains Mono,monospace"),
-                        customdata=[[p[0], p[1] + y_offset] for p in visible_pts],
+                        customdata=[[p[0] + x_offset, p[1] + y_offset] for p in visible_pts],
                         hovertemplate="<b>Sub-Pixel Inlier #%{text}</b><br>Slice (x, y): (%{x:.2f}, %{y:.2f}) px<br>Global (x, y): (%{customdata[0]:.2f}, %{customdata[1]:.2f}) px<extra></extra>",
                         name="Sub-Pixel Inliers",
                         showlegend=False
@@ -1888,7 +1937,7 @@ elif sel == "Alignment Inspection":
                 if show_tie:
                     st.markdown(
                         f'<div style="display:flex;align-items:center;gap:8px;margin-top:4px;font-size:0.77rem;color:#38bdf8;font-family:\'JetBrains Mono\',monospace;">'
-                        f'<span>ACTIVE TIE-POINTS: <b>{len(visible_pts)}</b> / {len(pts1_t)} in current swath window</span>'
+                        f'<span>ACTIVE TIE-POINTS: <b>{len(visible_pts)}</b> / {len(pts1_global)} in current swath window</span>'
                         f'<span class="chip chip-a" style="font-size:0.68rem;">Sub-Pixel Refined (cv2.cornerSubPix)</span>'
                         f'<span class="chip chip-s" style="font-size:0.68rem;">RMSE &lt; 1.0 px Verified</span>'
                         f'</div>',
