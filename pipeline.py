@@ -644,15 +644,67 @@ def get_device():
         return torch.device("mps")
     return torch.device("cpu")
 
-def run_loftr_branch(img0, img1) -> dict:
+def create_valid_data_mask(img: np.ndarray, margin: int = 3, min_val: int = 1) -> np.ndarray:
+    """Generate a strict binary mask of valid image data excluding zero/blank padding.
+    
+    Applies morphological erosion by `margin` pixels to prevent false matches
+    on the artificial high-contrast transition boundary between valid imagery
+    and null/black space padding.
+    
+    Args:
+        img: Input 2D or 3D grayscale/RGB array.
+        margin: Number of boundary pixels to erode away from padding edges.
+        min_val: Threshold above which a pixel is considered valid data.
+        
+    Returns:
+        Boolean 2D numpy mask where True indicates valid lunar surface terrain.
+    """
+    if img is None:
+        return None
+    if img.ndim == 3:
+        mask = np.any(img >= min_val, axis=2)
+    else:
+        mask = (img >= min_val)
+    if margin > 0 and np.any(mask):
+        ksize = 2 * margin + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
+        mask = cv2.erode(mask.astype(np.uint8), kernel).astype(bool)
+    return mask
+
+def filter_matches_by_mask(pts0: np.ndarray, pts1: np.ndarray,
+                           mask0: Optional[np.ndarray], mask1: Optional[np.ndarray],
+                           h0: int, w0: int, h1: int, w1: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Filter correspondences to ensure both points fall strictly within valid data masks."""
+    if len(pts0) == 0 or len(pts1) == 0:
+        return np.empty((0, 2)), np.empty((0, 2))
+    
+    valid = np.ones(len(pts0), dtype=bool)
+    if mask0 is not None:
+        y0_c = np.clip(np.round(pts0[:, 1]).astype(int), 0, h0 - 1)
+        x0_c = np.clip(np.round(pts0[:, 0]).astype(int), 0, w0 - 1)
+        valid &= mask0[y0_c, x0_c]
+    if mask1 is not None:
+        y1_c = np.clip(np.round(pts1[:, 1]).astype(int), 0, h1 - 1)
+        x1_c = np.clip(np.round(pts1[:, 0]).astype(int), 0, w1 - 1)
+        valid &= mask1[y1_c, x1_c]
+        
+    return pts0[valid], pts1[valid]
+
+def run_loftr_branch(img0, img1, mask0: Optional[np.ndarray] = None, mask1: Optional[np.ndarray] = None) -> dict:
     try:
         from kornia.feature import LoFTR
-        print("\n[LoFTR] Running appearance branch...")
+        print("\n[LoFTR] Running appearance branch with strict data masking...")
         dev = get_device()
         matcher = LoFTR(pretrained=LOFTR_PRETRAINED).to(dev).eval()
 
         h0, w0 = img0.shape[:2]
         h1, w1 = img1.shape[:2]
+
+        if mask0 is None:
+            mask0 = create_valid_data_mask(img0, margin=3)
+        if mask1 is None:
+            mask1 = create_valid_data_mask(img1, margin=3)
+
         scale = min(1.0, MAX_LOFTR_SIDE / max(h0, w0), MAX_LOFTR_SIDE / max(h1, w1))
         
         if scale < 1.0:
@@ -695,6 +747,12 @@ def run_loftr_branch(img0, img1) -> dict:
         # Rescale coordinates back to original full resolution
         pts0 = kpts0[valid] / scale
         pts1 = kpts1[valid] / scale
+
+        # Mandatory data masking: purge matches falling on null/padding pixels
+        pts0, pts1 = filter_matches_by_mask(pts0, pts1, mask0, mask1, h0, w0, h1, w1)
+        if len(pts0) < 4:
+            print(f"[LoFTR] Matches after valid-data masking: {len(pts0)} (< 4 required)")
+            return _empty_matches()
         
         res = ransac_homography(pts0, pts1, threshold=5.0, img_ref=img1, img_tgt=img0)
         res['score'] = float(res['inlier_ratio'])
@@ -704,36 +762,39 @@ def run_loftr_branch(img0, img1) -> dict:
         print(f"[LoFTR] Error: {e}")
         return _empty_matches()
 
-def run_roma_branch(img0, img1, device=None, num_samples=5000) -> dict:
+def run_roma_branch(img0, img1, device=None, num_samples=5000,
+                    mask0: Optional[np.ndarray] = None, mask1: Optional[np.ndarray] = None) -> dict:
     try:
         # Check system RAM before attempting to load 1.55 GB RoMa + DINOv2 weights.
-        # Streamlit Community Cloud enforces a 1.0 GB cgroup memory limit which triggers an instant SIGKILL.
         ram_gb = get_system_ram_gb()
         if ram_gb < 3.5 and not (device == "cuda" or (torch.cuda.is_available() and device != "cpu")):
             print(f"[RoMa] Memory constrained container ({ram_gb:.1f}GB RAM, no CUDA GPU). Safely falling back to SIFT.")
-            return run_sift_branch(img0, img1)
+            return run_sift_branch(img0, img1, mask0=mask0, mask1=mask1)
 
         from romatch import roma_outdoor
         import tempfile
-        print("\n[RoMa] Running certainty-guided dense matching...")
-        # RoMa uses cholesky solve which is unsupported on Apple MPS, default to CPU on Mac
+        print("\n[RoMa] Running certainty-guided dense matching with strict data masking...")
         dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
         model = roma_outdoor(device=dev)
         for m in model.modules():
             if hasattr(m, "use_custom_corr"):
                 m.use_custom_corr = False
                 
+        h0, w0 = img0.shape[:2]
+        h1, w1 = img1.shape[:2]
+
+        if mask0 is None:
+            mask0 = create_valid_data_mask(img0, margin=3)
+        if mask1 is None:
+            mask1 = create_valid_data_mask(img1, margin=3)
+
         def save_tmp(img):
             rgb = cv2.cvtColor(normalize_percentile(img), cv2.COLOR_GRAY2RGB)
             f = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             cv2.imwrite(f.name, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
             return f.name
-
-        h0, w0 = img0.shape[:2]
         
         # NASA/ISRO Pushbroom Along-Track Tiling:
-        # If image is an elongated orbital pushbroom strip (aspect ratio > 2.2),
-        # slice into along-track square tiles to eliminate the 6:1 vertical squashing distortion
         if h0 / max(1, w0) > 2.2:
             print(f"[RoMa] Pushbroom strip detected ({h0}x{w0}) - deploying NASA/ISRO along-track 3-region tiling...")
             tile_len = min(750, h0)
@@ -745,6 +806,14 @@ def run_roma_branch(img0, img1, device=None, num_samples=5000) -> dict:
                 r1 = min(h0, r0 + tile_len)
                 tile_o = img0[r0:r1, :]
                 tile_t = img1[r0:r1, :]
+                tile_m0 = mask0[r0:r1, :] if mask0 is not None else None
+                tile_m1 = mask1[r0:r1, :] if mask1 is not None else None
+                
+                # If tile contains no valid data, skip
+                if tile_m0 is not None and np.sum(tile_m0) < 100:
+                    continue
+                if tile_m1 is not None and np.sum(tile_m1) < 100:
+                    continue
                 
                 p0, p1 = save_tmp(tile_o), save_tmp(tile_t)
                 warp, cert = model.match(p0, p1, device=dev)
@@ -757,6 +826,13 @@ def run_roma_branch(img0, img1, device=None, num_samples=5000) -> dict:
                 p0_np = k0.cpu().numpy()
                 p1_np = k1.cpu().numpy()
                 c_np = s_cert.cpu().numpy()
+
+                # Filter sampled matches by local tile valid-data masks
+                p0_np, p1_np = filter_matches_by_mask(
+                    p0_np, p1_np, tile_m0, tile_m1, tile_o.shape[0], tile_o.shape[1], tile_t.shape[0], tile_t.shape[1]
+                )
+                if len(p0_np) == 0:
+                    continue
                 
                 # Transform to global pushbroom coordinates
                 p0_np[:, 1] += r0
@@ -775,7 +851,7 @@ def run_roma_branch(img0, img1, device=None, num_samples=5000) -> dict:
                 if np.any(valid_disp):
                     all_p0.append(p0_np[valid_disp])
                     all_p1.append(p1_np[valid_disp])
-                    all_certs.append(c_np[valid_disp])
+                    all_certs.append(c_np[:len(p0_np)][valid_disp])
                     
             if all_p0:
                 pts0 = np.concatenate(all_p0, axis=0)
@@ -792,6 +868,12 @@ def run_roma_branch(img0, img1, device=None, num_samples=5000) -> dict:
             s_matches, s_cert = model.sample(warp, cert, num=num_samples)
             kpts0, kpts1 = model.to_pixel_coordinates(s_matches, img0.shape[0], img0.shape[1], img1.shape[0], img1.shape[1])
             pts0, pts1 = kpts0.cpu().numpy(), kpts1.cpu().numpy()
+
+        # Strict global data mask enforcement
+        pts0, pts1 = filter_matches_by_mask(pts0, pts1, mask0, mask1, h0, w0, h1, w1)
+        if len(pts0) < 4:
+            print(f"[RoMa] Matches after valid-data masking: {len(pts0)} (< 4 required)")
+            return _empty_matches()
         
         res = ransac_homography(pts0, pts1, threshold=4.5, img_ref=img1, img_tgt=img0)
         res['score'] = float(res['inlier_ratio'])
@@ -801,13 +883,20 @@ def run_roma_branch(img0, img1, device=None, num_samples=5000) -> dict:
         print(f"[RoMa] Error: {e}")
         return _empty_matches()
 
-def run_lightglue_branch(img0, img1, device=None, max_keypoints=2048) -> dict:
+def run_lightglue_branch(img0, img1, device=None, max_keypoints=2048,
+                         mask0: Optional[np.ndarray] = None, mask1: Optional[np.ndarray] = None) -> dict:
     try:
         from lightglue import LightGlue, DISK
         from lightglue.utils import rbd
-        # Use CUDA if available; fall back to CPU (avoids MPS aten::kthvalue op limitation on Mac)
         dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
+        h0, w0 = img0.shape[:2]
+        h1, w1 = img1.shape[:2]
+        if mask0 is None:
+            mask0 = create_valid_data_mask(img0, margin=3)
+        if mask1 is None:
+            mask1 = create_valid_data_mask(img1, margin=3)
+
         def to_tensor(img):
             rgb = np.stack([img]*3, axis=0).astype(np.float32) / 255.0
             return torch.from_numpy(rgb).to(dev)
@@ -823,6 +912,11 @@ def run_lightglue_branch(img0, img1, device=None, max_keypoints=2048) -> dict:
         idx = m["matches"]
         pts0 = f0["keypoints"][idx[:,0]].cpu().numpy()
         pts1 = f1["keypoints"][idx[:,1]].cpu().numpy()
+
+        # Strict valid-data mask filtering
+        pts0, pts1 = filter_matches_by_mask(pts0, pts1, mask0, mask1, h0, w0, h1, w1)
+        if len(pts0) < 4:
+            return _empty_matches()
         
         res = ransac_homography(pts0, pts1, img_ref=img1, img_tgt=img0)
         res['score'] = res['inlier_ratio']
@@ -831,13 +925,24 @@ def run_lightglue_branch(img0, img1, device=None, max_keypoints=2048) -> dict:
         print(f"[LightGlue] Error: {e}")
         return _empty_matches()
 
-def run_sift_branch(img0, img1) -> dict:
+def run_sift_branch(img0, img1, mask0: Optional[np.ndarray] = None, mask1: Optional[np.ndarray] = None) -> dict:
     try:
-        print("\n[SIFT] Running...")
+        print("\n[SIFT] Running with strict valid-data masking...")
+        h0, w0 = img0.shape[:2]
+        h1, w1 = img1.shape[:2]
+        if mask0 is None:
+            mask0 = create_valid_data_mask(img0, margin=3)
+        if mask1 is None:
+            mask1 = create_valid_data_mask(img1, margin=3)
+            
+        m0_u8 = (mask0.astype(np.uint8) * 255) if mask0 is not None else None
+        m1_u8 = (mask1.astype(np.uint8) * 255) if mask1 is not None else None
+
         sift = cv2.SIFT_create(nfeatures=4000)
-        kp0, des0 = sift.detectAndCompute(img0, None)
-        kp1, des1 = sift.detectAndCompute(img1, None)
-        if des0 is None or des1 is None: return _empty_matches()
+        kp0, des0 = sift.detectAndCompute(img0, m0_u8)
+        kp1, des1 = sift.detectAndCompute(img1, m1_u8)
+        if des0 is None or des1 is None or len(kp0) < 4 or len(kp1) < 4:
+            return _empty_matches()
         
         bf = cv2.BFMatcher()
         matches = bf.knnMatch(des0, des1, k=2)
@@ -845,6 +950,10 @@ def run_sift_branch(img0, img1) -> dict:
         
         pts0 = np.float32([kp0[m.queryIdx].pt for m in good])
         pts1 = np.float32([kp1[m.trainIdx].pt for m in good])
+
+        pts0, pts1 = filter_matches_by_mask(pts0, pts1, mask0, mask1, h0, w0, h1, w1)
+        if len(pts0) < 4:
+            return _empty_matches()
         
         res = ransac_homography(pts0, pts1, img_ref=img1, img_tgt=img0)
         res['score'] = res['inlier_ratio']
@@ -853,13 +962,24 @@ def run_sift_branch(img0, img1) -> dict:
         print(f"[SIFT] Error: {e}")
         return _empty_matches()
 
-def run_orb_branch(img0, img1) -> dict:
+def run_orb_branch(img0, img1, mask0: Optional[np.ndarray] = None, mask1: Optional[np.ndarray] = None) -> dict:
     try:
-        print("\n[ORB] Running...")
+        print("\n[ORB] Running with strict valid-data masking...")
+        h0, w0 = img0.shape[:2]
+        h1, w1 = img1.shape[:2]
+        if mask0 is None:
+            mask0 = create_valid_data_mask(img0, margin=3)
+        if mask1 is None:
+            mask1 = create_valid_data_mask(img1, margin=3)
+
+        m0_u8 = (mask0.astype(np.uint8) * 255) if mask0 is not None else None
+        m1_u8 = (mask1.astype(np.uint8) * 255) if mask1 is not None else None
+
         orb = cv2.ORB_create(nfeatures=4000)
-        kp0, des0 = orb.detectAndCompute(img0, None)
-        kp1, des1 = orb.detectAndCompute(img1, None)
-        if des0 is None or des1 is None: return _empty_matches()
+        kp0, des0 = orb.detectAndCompute(img0, m0_u8)
+        kp1, des1 = orb.detectAndCompute(img1, m1_u8)
+        if des0 is None or des1 is None or len(kp0) < 4 or len(kp1) < 4:
+            return _empty_matches()
         
         bf = cv2.BFMatcher(cv2.NORM_HAMMING)
         matches = bf.knnMatch(des0, des1, k=2)
@@ -872,6 +992,10 @@ def run_orb_branch(img0, img1) -> dict:
                     
         pts0 = np.float32([kp0[m.queryIdx].pt for m in good])
         pts1 = np.float32([kp1[m.trainIdx].pt for m in good])
+
+        pts0, pts1 = filter_matches_by_mask(pts0, pts1, mask0, mask1, h0, w0, h1, w1)
+        if len(pts0) < 4:
+            return _empty_matches()
         
         res = ransac_homography(pts0, pts1, img_ref=img1, img_tgt=img0)
         res['score'] = res['inlier_ratio']
@@ -1366,16 +1490,18 @@ def run_pipeline(ohrc_xml, tmc_xml, matchers=None, preprocessing='phase_congruen
     roi_ohrc = ohrc_coarse_aligned[y0:y1, x0:x1]
     roi_tmc = tmc_crop[y0:y1, x0:x1]
     
-    print("[PIPELINE] 5. Preprocessing for matching...")
+    print("[PIPELINE] 5. Preprocessing for matching with strict data masking...")
     ohrc_prep, tmc_prep = prepare_images(roi_ohrc, roi_tmc, mode=preprocessing)
+    mask0_roi = create_valid_data_mask(roi_ohrc, margin=3)
+    mask1_roi = create_valid_data_mask(roi_tmc, margin=3)
     
-    print("[PIPELINE] 6. Feature Matching...")
+    print("[PIPELINE] 6. Feature Matching (Strict Valid Data Masking Enforced)...")
     results_dict = {}
-    if 'loftr' in matchers: results_dict['loftr'] = run_loftr_branch(ohrc_prep, tmc_prep); gc.collect()
-    if 'roma' in matchers: results_dict['roma'] = run_roma_branch(ohrc_prep, tmc_prep); gc.collect()
-    if 'lightglue' in matchers: results_dict['lightglue'] = run_lightglue_branch(ohrc_prep, tmc_prep); gc.collect()
-    if 'sift' in matchers: results_dict['sift'] = run_sift_branch(ohrc_prep, tmc_prep); gc.collect()
-    if 'orb' in matchers: results_dict['orb'] = run_orb_branch(ohrc_prep, tmc_prep); gc.collect()
+    if 'loftr' in matchers: results_dict['loftr'] = run_loftr_branch(ohrc_prep, tmc_prep, mask0=mask0_roi, mask1=mask1_roi); gc.collect()
+    if 'roma' in matchers: results_dict['roma'] = run_roma_branch(ohrc_prep, tmc_prep, mask0=mask0_roi, mask1=mask1_roi); gc.collect()
+    if 'lightglue' in matchers: results_dict['lightglue'] = run_lightglue_branch(ohrc_prep, tmc_prep, mask0=mask0_roi, mask1=mask1_roi); gc.collect()
+    if 'sift' in matchers: results_dict['sift'] = run_sift_branch(ohrc_prep, tmc_prep, mask0=mask0_roi, mask1=mask1_roi); gc.collect()
+    if 'orb' in matchers: results_dict['orb'] = run_orb_branch(ohrc_prep, tmc_prep, mask0=mask0_roi, mask1=mask1_roi); gc.collect()
     if 'cnsfm' in matchers: results_dict['cnsfm'] = run_cnsfm_branch(ohrc_prep, tmc_prep); gc.collect()
     
     # Shift matched coordinates back to full TMC canvas frame
