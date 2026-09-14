@@ -15,6 +15,26 @@ import plotly.graph_objects as go
 import plotly.express as px
 from scipy.ndimage import gaussian_filter
 
+def get_system_ram_gb() -> float:
+    """Safely return total system RAM in GB using standard library os or psutil."""
+    try:
+        import psutil
+        return float(psutil.virtual_memory().total / (1024**3))
+    except Exception:
+        pass
+    try:
+        return float((os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')) / (1024**3))
+    except Exception:
+        pass
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if 'MemTotal' in line:
+                    return float(line.split()[1]) / (1024**2)
+    except Exception:
+        pass
+    return 1.0
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1151,10 +1171,8 @@ if sel == "Mission Control":
                     ro2, rt2 = prepare_images(roi_o, roi_t, 'phase_congruency')
 
                     # Memory guard for constrained cloud containers (e.g. Streamlit Cloud 1GB limit)
-                    import psutil
-                    total_ram_gb = psutil.virtual_memory().total / (1024**3)
-                    avail_ram_gb = psutil.virtual_memory().available / (1024**3)
-                    can_run_roma = (total_ram_gb >= 3.5 and avail_ram_gb >= 1.8) or torch.cuda.is_available()
+                    total_ram_gb = get_system_ram_gb()
+                    can_run_roma = (total_ram_gb >= 3.5) or torch.cuda.is_available()
 
                     if can_run_roma:
                         res_r = run_roma_branch(ro2, rt2)
@@ -1478,8 +1496,7 @@ elif sel == "Verification Studio":
                         roi_target = tgt_c[y0:y1, x0:x1]
                         roi_ref = ref_img[y0:y1, x0:x1]
                         if "RoMa" in cust_matcher:
-                            import psutil
-                            _ram_gb = psutil.virtual_memory().total / (1024**3)
+                            _ram_gb = get_system_ram_gb()
                             if _ram_gb < 3.5 and not torch.cuda.is_available():
                                 print("[PIPELINE] Constrained RAM (<3.5GB). Using SIFT to prevent crash.")
                                 res_m = run_sift_branch(p0_prep, p1_prep)

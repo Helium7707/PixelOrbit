@@ -14,3 +14,4 @@ timm>=0.9.0
 einops>=0.7.0
 romatch>=0.1.2
 git+https://github.com/cvg/LightGlue.git
+psutil>=5.9.0
