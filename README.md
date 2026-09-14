@@ -1,3 +1,14 @@
+---
+title: PixelOrbit Chandrayaan-2 Registration
+emoji: 🌑
+colorFrom: blue
+colorTo: indigo
+sdk: streamlit
+sdk_version: "1.35.0"
+app_file: app.py
+pinned: false
+---
+
 # 🌓 PixelOrbit — Chandrayaan-2 Cross-Sensor Lunar Image Registration
 
 > **SIH 2026 | Problem Statement PS 26166**

@@ -1149,9 +1149,21 @@ if sel == "Mission Control":
                         y0, y1, x0, x1 = 0, ht, 0, wt
                     roi_o, roi_t = ohrc_c[y0:y1, x0:x1], tmc_crop[y0:y1, x0:x1]
                     ro2, rt2 = prepare_images(roi_o, roi_t, 'phase_congruency')
-                    res_r = run_roma_branch(ro2, rt2)
+
+                    # Memory guard for constrained cloud containers (e.g. Streamlit Cloud 1GB limit)
+                    import psutil
+                    total_ram_gb = psutil.virtual_memory().total / (1024**3)
+                    avail_ram_gb = psutil.virtual_memory().available / (1024**3)
+                    can_run_roma = (total_ram_gb >= 3.5 and avail_ram_gb >= 1.8) or torch.cuda.is_available()
+
+                    if can_run_roma:
+                        res_r = run_roma_branch(ro2, rt2)
+                    else:
+                        print(f"[PIPELINE] Memory constrained container ({total_ram_gb:.1f}GB RAM). Using Cloud-Safe matching.")
+                        res_r = run_sift_branch(ro2, rt2)
+
                     n_in = res_r.get('inliers', 0)
-                    if n_in < 4:
+                    if n_in < 4 and can_run_roma:
                         try:
                             res_sift = run_sift_branch(ro2, rt2)
                             if res_sift.get('inliers', 0) >= 4:
@@ -1465,8 +1477,14 @@ elif sel == "Verification Studio":
                             y0, y1, x0, x1 = 0, ht, 0, wt
                         roi_target = tgt_c[y0:y1, x0:x1]
                         roi_ref = ref_img[y0:y1, x0:x1]
-                        p0_prep, p1_prep = prepare_images(roi_target, roi_ref, pc)
-                        if "RoMa" in cust_matcher:       res_m = run_roma_branch(p0_prep, p1_prep)
+                        if "RoMa" in cust_matcher:
+                            import psutil
+                            _ram_gb = psutil.virtual_memory().total / (1024**3)
+                            if _ram_gb < 3.5 and not torch.cuda.is_available():
+                                print("[PIPELINE] Constrained RAM (<3.5GB). Using SIFT to prevent crash.")
+                                res_m = run_sift_branch(p0_prep, p1_prep)
+                            else:
+                                res_m = run_roma_branch(p0_prep, p1_prep)
                         elif "LoFTR" in cust_matcher:    res_m = run_loftr_branch(p0_prep, p1_prep)
                         elif "LightGlue" in cust_matcher: res_m = run_lightglue_branch(p0_prep, p1_prep)
                         else:                             res_m = run_sift_branch(p0_prep, p1_prep)
