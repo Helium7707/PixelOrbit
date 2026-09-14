@@ -186,21 +186,31 @@ def cached_get_preview_thumbnail(
         r0, r1, c0, c1 = 0, meta['lines'], 0, meta['samples']
         lines, samples = meta['lines'], meta['samples']
 
-    # Compute a uniform isotropic step that satisfies both width and height limits
-    step_w = max(1, samples // max_width)
-    step_h = max(1, lines // max_lines)
-    step = max(step_w, step_h)
+    has_raw_file = (meta.get('img_path') is not None and os.path.exists(meta['img_path']))
+    if has_raw_file:
+        # Compute a uniform isotropic step that satisfies both width and height limits
+        step_w = max(1, samples // max_width)
+        step_h = max(1, lines // max_lines)
+        step = max(step_w, step_h)
 
-    raw = load_pds4_decimated(
-        meta['img_path'], r0, r1, c0, c1,
-        meta['samples'], meta['dtype'], step, offset=meta.get('offset', 0)
-    )
+        raw = load_pds4_decimated(
+            meta['img_path'], r0, r1, c0, c1,
+            meta['samples'], meta['dtype'], step, offset=meta.get('offset', 0)
+        )
 
-    # load_pds4_decimated applies the step along rows, but returns full column width.
-    # We must decimate columns by the exact same factor to preserve 1:1 square pixel aspect ratio:
-    pw = max(16, samples // step)
-    ph = raw.shape[0]
-    resized = cv2.resize(raw, (pw, ph), interpolation=cv2.INTER_AREA)
+        # load_pds4_decimated applies the step along rows, but returns full column width.
+        # We must decimate columns by the exact same factor to preserve 1:1 square pixel aspect ratio:
+        pw = max(16, samples // step)
+        ph = raw.shape[0]
+        resized = cv2.resize(raw, (pw, ph), interpolation=cv2.INTER_AREA)
+    else:
+        # Cloud deployment fallback: load pre-generated thumbnail from results_demo
+        tag = "ohrc" if "ohr" in xml_path.lower() else "tmc"
+        demo_thumb_p = os.path.join(ROOT, "results_demo", f"{tag}_thumb.png")
+        if os.path.exists(demo_thumb_p):
+            resized = cv2.imread(demo_thumb_p, cv2.IMREAD_GRAYSCALE)
+        else:
+            resized = np.zeros((400, 320), dtype=np.uint8)
 
     # Normalize contrast strictly on valid (non-zero) pixels to uint8
     v = resized[resized > 0]
@@ -752,14 +762,26 @@ def load_default_mission_telemetry(ref_mission=None):
         tm = cached_parse_metadata(default_tmc)
         fp = compute_footprint(om, tm)
         tb, ob = fp['tmc_bbox'], fp['ohrc_bbox']
-        tmc_crop = load_pds4_window(tm['img_path'], tb[0], tb[1], tb[2], tb[3],
-                                    tm['samples'], tm['dtype'], offset=tm.get('offset', 0))
-        step = max(1, int(round(tm['gsd'] / om['gsd'])))
-        ohrc_raw = load_pds4_decimated(om['img_path'], ob[0], ob[1], ob[2], ob[3],
-                                       om['samples'], om['dtype'], step, offset=om.get('offset', 0))
-        target_w = max(32, int(round(ohrc_raw.shape[1] * om['gsd'] / tm['gsd'])))
-        target_h = max(32, int(round(ohrc_raw.shape[0] * step * om['gsd'] / tm['gsd'])))
-        ohrc_crop = cv2.resize(ohrc_raw, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        has_raw_img = (om.get('img_path') is not None and os.path.exists(om['img_path']) and
+                       tm.get('img_path') is not None and os.path.exists(tm['img_path']))
+        if has_raw_img:
+            tmc_crop = load_pds4_window(tm['img_path'], tb[0], tb[1], tb[2], tb[3],
+                                        tm['samples'], tm['dtype'], offset=tm.get('offset', 0))
+            step = max(1, int(round(tm['gsd'] / om['gsd'])))
+            ohrc_raw = load_pds4_decimated(om['img_path'], ob[0], ob[1], ob[2], ob[3],
+                                           om['samples'], om['dtype'], step, offset=om.get('offset', 0))
+            target_w = max(32, int(round(ohrc_raw.shape[1] * om['gsd'] / tm['gsd'])))
+            target_h = max(32, int(round(ohrc_raw.shape[0] * step * om['gsd'] / tm['gsd'])))
+            ohrc_crop = cv2.resize(ohrc_raw, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        else:
+            p_tmc = os.path.join(ROOT, "results_demo", "tmc_crop.png")
+            p_ohrc = os.path.join(ROOT, "results_demo", "ohrc_crop.png")
+            if os.path.exists(p_tmc) and os.path.exists(p_ohrc):
+                tmc_crop = cv2.imread(p_tmc, cv2.IMREAD_GRAYSCALE)
+                ohrc_crop = cv2.imread(p_ohrc, cv2.IMREAD_GRAYSCALE)
+                ohrc_raw = ohrc_crop.copy()
+            else:
+                raise FileNotFoundError("Raw .img files and results_demo crops are missing.")
 
         fp2 = os.path.join(ROOT, "results", "fused.png")
         if not os.path.exists(fp2):
@@ -942,14 +964,22 @@ if sel == "Mission Control":
                     tm = cached_parse_metadata(default_tmc)
                     fp = compute_footprint(om, tm)
                     tb, ob = fp['tmc_bbox'], fp['ohrc_bbox']
-                    tmc_crop = load_pds4_window(tm['img_path'], tb[0], tb[1], tb[2], tb[3],
-                                                tm['samples'], tm['dtype'], offset=tm.get('offset', 0))
-                    step = max(1, int(round(tm['gsd'] / om['gsd'])))
-                    ohrc_raw = load_pds4_decimated(om['img_path'], ob[0], ob[1], ob[2], ob[3],
-                                                   om['samples'], om['dtype'], step, offset=om.get('offset', 0))
-                    tw = max(32, int(round(ohrc_raw.shape[1] * om['gsd'] / tm['gsd'])))
-                    th = max(32, int(round(ohrc_raw.shape[0] * step * om['gsd'] / tm['gsd'])))
-                    ohrc_crop = cv2.resize(ohrc_raw, (tw, th), interpolation=cv2.INTER_AREA)
+                    has_raw = (om.get('img_path') and os.path.exists(om['img_path']) and
+                               tm.get('img_path') and os.path.exists(tm['img_path']))
+                    if has_raw:
+                        tmc_crop = load_pds4_window(tm['img_path'], tb[0], tb[1], tb[2], tb[3],
+                                                    tm['samples'], tm['dtype'], offset=tm.get('offset', 0))
+                        step = max(1, int(round(tm['gsd'] / om['gsd'])))
+                        ohrc_raw = load_pds4_decimated(om['img_path'], ob[0], ob[1], ob[2], ob[3],
+                                                       om['samples'], om['dtype'], step, offset=om.get('offset', 0))
+                        tw = max(32, int(round(ohrc_raw.shape[1] * om['gsd'] / tm['gsd'])))
+                        th = max(32, int(round(ohrc_raw.shape[0] * step * om['gsd'] / tm['gsd'])))
+                        ohrc_crop = cv2.resize(ohrc_raw, (tw, th), interpolation=cv2.INTER_AREA)
+                    else:
+                        p_tmc = os.path.join(ROOT, "results_demo", "tmc_crop.png")
+                        p_ohrc = os.path.join(ROOT, "results_demo", "ohrc_crop.png")
+                        tmc_crop = cv2.imread(p_tmc, cv2.IMREAD_GRAYSCALE)
+                        ohrc_crop = cv2.imread(p_ohrc, cv2.IMREAD_GRAYSCALE)
                     op, tp2 = prepare_images(ohrc_crop, tmc_crop, 'phase_congruency')
                     ar = coarse_to_fine_align(op, tp2)
                     ht, wt = tmc_crop.shape[:2]

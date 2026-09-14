@@ -256,13 +256,12 @@ def parse_pds4_metadata(xml_path: str) -> dict:
         if file_el is not None:
             fn_el = file_el.find("pds:file_name", pds_ns)
             if fn_el is not None:
-                img_path = os.path.join(os.path.dirname(os.path.abspath(xml_path)), fn_el.text.strip())
-    
-    if not os.path.exists(img_path):
-        raise FileNotFoundError(f"Image file not found for {xml_path}")
+                cand = os.path.join(os.path.dirname(os.path.abspath(xml_path)), fn_el.text.strip())
+                if os.path.exists(cand):
+                    img_path = cand
 
-    meta["img_path"] = img_path
-    
+    meta["img_path"] = img_path if (img_path and os.path.exists(img_path)) else None
+
     return meta
 
 def load_pds4_window(filepath, r_start, r_end, c_start, c_end, total_samples, dtype, offset=0) -> np.ndarray:

@@ -1,0 +1,33 @@
+# Python virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large Chandrayaan-2 PDS4 Binary Imagery (> 1 GB each)
+*.img
+*.IMG
+
+# Generated output folders & logs
+results/
+results_test/
+benchmark_results/
+wandb/
+.system_generated/
+
+# Large local exploration notebooks & debug dumps
+testing.ipynb
+cnsfm_debug.png
+hybrid_correspondence_result.png
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Streamlit local state
+.streamlit/credentials.toml

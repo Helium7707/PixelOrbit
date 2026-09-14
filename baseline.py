@@ -43,7 +43,7 @@ from kornia.feature import LoFTR
 # =============================================================================
 
 
-ROOT = "/home/hriday/Python-workspace/Sih"
+ROOT = os.path.dirname(os.path.abspath(__file__))
 
 OHRC_XML = f"{ROOT}/ch2_ohr_ncp_20231004T0406038822_d_img_d18.xml"
 TMC_XML = f"{ROOT}/ch2_tmc_ncn_20250707T1853051045_d_img_d18.xml"
@@ -266,7 +266,7 @@ def parse_pds4_metadata(xml_path):
         img_path = os.path.splitext(xml_path)[0] + ".IMG"
 
     if not os.path.exists(img_path):
-        raise FileNotFoundError(f"Image file not found for {xml_path}")
+        img_path = None
 
     meta["img_path"] = img_path
 
