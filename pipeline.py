@@ -540,37 +540,50 @@ def coarse_to_fine_align(
     
     res = algorithms.log_polar_fourier_mellin(t_thumb, o_thumb)
     raw_rot = res.get('rotation_deg', 0.0)
+    fmt_conf = res.get('confidence', 0.0)
+    scale = float(np.clip(res.get('scale', 1.0), 0.85, 1.15))
     
-    # In Chandrayaan-2 lunar near-polar orbits, forward flight direction is within +/-30 deg.
-    # Discard 180-deg Hermitian symmetry ambiguity if present.
+    # In Chandrayaan-2 lunar near-polar orbits, spacecraft roll/pitch/yaw is bounded within +/-5 deg.
     rot_cand = (raw_rot + 180.0) % 360.0 - 180.0
     if abs(rot_cand) > 45.0:
         alt_rot = (rot_cand + 180.0) % 360.0 - 180.0
         if abs(alt_rot) < abs(rot_cand):
             rot_cand = alt_rot
-    rot = float(np.clip(rot_cand, -30.0, 30.0))
-    scale = float(np.clip(res.get('scale', 1.0), 0.85, 1.15))
-    print(f"[PIPELINE] Coarse FMT: rot={rot:.2f}°, scale={scale:.4f}")
+    rot_bounded = float(np.clip(rot_cand, -5.0, 5.0))
     
-    # Sub-pixel translation refinement on the TMC canvas
-    M_rot = cv2.getRotationMatrix2D((wo / 2.0, ho / 2.0), rot, 1.0 / scale)
-    M_rot[0, 2] += (wt - wo) / 2.0
-    M_rot[1, 2] += (ht - ho) / 2.0
+    # Evaluate candidates: 0.0° (spacecraft nominal co-aligned geometry) vs rot_bounded
+    best_score = -999.0
+    best_rot = 0.0
+    best_dx, best_dy = 0.0, 0.0
+    best_M = None
     
-    derotated = cv2.warpAffine(ohrc_prep.astype(np.float32), M_rot, (wt, ht), flags=cv2.INTER_LINEAR)
-    (dx, dy), score = algorithms.phase_correlation_subpx(tmc_prep, derotated)
-    print(f"[PIPELINE] Sub-pixel refinement: dx={dx:.2f}, dy={dy:.2f}, peak={score:.3f}")
-    
-    M_final = M_rot.copy()
-    M_final[0, 2] += dx
-    M_final[1, 2] += dy
+    candidates = [0.0]
+    if fmt_conf > 0.02 and abs(rot_bounded) > 0.1:
+        candidates.append(rot_bounded)
+        
+    for c_rot in candidates:
+        M_rot = cv2.getRotationMatrix2D((wo / 2.0, ho / 2.0), c_rot, 1.0 / scale)
+        M_rot[0, 2] += (wt - wo) / 2.0
+        M_rot[1, 2] += (ht - ho) / 2.0
+        derotated = cv2.warpAffine(ohrc_prep.astype(np.float32), M_rot, (wt, ht), flags=cv2.INTER_LINEAR)
+        (dx, dy), score = algorithms.phase_correlation_subpx(tmc_prep, derotated)
+        if score > best_score:
+            best_score = score
+            best_rot = c_rot
+            best_dx, best_dy = dx, dy
+            M_final = M_rot.copy()
+            M_final[0, 2] += dx
+            M_final[1, 2] += dy
+            best_M = M_final
+            
+    print(f"[PIPELINE] Coarse alignment: rot={best_rot:.2f}°, scale={scale:.4f}, dx={best_dx:.2f}, dy={best_dy:.2f}, peak={best_score:.4f}")
     
     return {
-        'rotation_deg': rot,
+        'rotation_deg': best_rot,
         'scale': scale,
-        'translation': (dx, dy),
-        'transform_matrix': M_final,
-        'confidence': score,
+        'translation': (best_dx, best_dy),
+        'transform_matrix': best_M,
+        'confidence': best_score,
     }
 
 # =============================================================================
@@ -671,12 +684,13 @@ def run_roma_branch(img0, img1, device=None, num_samples=5000) -> dict:
         # If image is an elongated orbital pushbroom strip (aspect ratio > 2.2),
         # slice into along-track square tiles to eliminate the 6:1 vertical squashing distortion
         if h0 / max(1, w0) > 2.2:
-            print(f"[RoMa] Pushbroom strip detected ({h0}x{w0}) - deploying NASA/ISRO along-track tiling...")
-            tile_len = min(600, h0)
-            stride = int(tile_len * 0.40)  # 60% overlap along orbital track (was 25%)
+            print(f"[RoMa] Pushbroom strip detected ({h0}x{w0}) - deploying NASA/ISRO along-track 3-region tiling...")
+            tile_len = min(750, h0)
+            offsets = [0, max(0, (h0 - tile_len) // 2), max(0, h0 - tile_len)]
+            offsets = sorted(list(set(offsets)))
             all_p0, all_p1, all_certs = [], [], []
             
-            for r0 in range(0, h0 - 150, stride):
+            for r0 in offsets:
                 r1 = min(h0, r0 + tile_len)
                 tile_o = img0[r0:r1, :]
                 tile_t = img1[r0:r1, :]
@@ -686,7 +700,7 @@ def run_roma_branch(img0, img1, device=None, num_samples=5000) -> dict:
                 os.unlink(p0)
                 os.unlink(p1)
                 
-                s_matches, s_cert = model.sample(warp, cert, num=900)  # was 600
+                s_matches, s_cert = model.sample(warp, cert, num=min(700, num_samples // len(offsets)))
                 k0, k1 = model.to_pixel_coordinates(s_matches, tile_o.shape[0], tile_o.shape[1], tile_t.shape[0], tile_t.shape[1])
                 
                 p0_np = k0.cpu().numpy()
@@ -698,15 +712,14 @@ def run_roma_branch(img0, img1, device=None, num_samples=5000) -> dict:
                 p1_np[:, 1] += r0
                 
                 # Adaptive orbital displacement consistency filter:
-                # Keeps matches that agree with the dominant translation of the tile within 7.5 px
                 disp = p1_np - p0_np
                 disp_norm = np.linalg.norm(disp, axis=1)
                 if len(disp) > 8:
                     med_disp = np.median(disp, axis=0)
                     res_disp = np.linalg.norm(disp - med_disp, axis=1)
-                    valid_disp = (res_disp < 7.5) & (disp_norm < 35.0)
+                    valid_disp = (res_disp < 10.0) & (disp_norm < 40.0)
                 else:
-                    valid_disp = disp_norm < 25.0
+                    valid_disp = disp_norm < 30.0
                 
                 if np.any(valid_disp):
                     all_p0.append(p0_np[valid_disp])
