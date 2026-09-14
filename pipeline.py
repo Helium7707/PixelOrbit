@@ -1252,20 +1252,33 @@ def run_pipeline(ohrc_xml, tmc_xml, matchers=None, preprocessing='phase_congruen
     print("[PIPELINE] 2. Computing footprints & ROIs...")
     geom = compute_footprint(o_meta, t_meta)
     tr = geom['tmc_bbox']
-    tmc_crop = load_pds4_window(t_meta['img_path'], tr[0], tr[1], tr[2], tr[3], t_meta['samples'], t_meta['dtype'], offset=t_meta.get('offset',0))
-    
-    # Load OHRC with decimation
     oroi = geom['ohrc_bbox']
     step = max(1, int(round(CURRENT_GSD['TMC-2'] / CURRENT_GSD['OHRC'])))
-    ohrc_raw = load_pds4_decimated(o_meta['img_path'], oroi[0], oroi[1], oroi[2], oroi[3], o_meta['samples'], o_meta['dtype'], step, offset=o_meta.get('offset',0))
-    
-    print("[PIPELINE] 3. GSD Normalization via Scale-Space Pyramid...")
-    target_w = max(32, int(round(ohrc_raw.shape[1] * o_meta['gsd'] / t_meta['gsd'])))
-    target_h = max(32, int(round(ohrc_raw.shape[0] * step * o_meta['gsd'] / t_meta['gsd'])))
-    factor = float(t_meta['gsd']) / float(o_meta['gsd'] * step)
-    ohrc_crop = scale_space_downsample(ohrc_raw, scale_factor=factor)
-    if ohrc_crop.shape[1] != target_w or ohrc_crop.shape[0] != target_h:
-        ohrc_crop = cv2.resize(ohrc_crop, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+    has_raw = (
+        o_meta.get('img_path') and os.path.exists(o_meta['img_path']) and
+        t_meta.get('img_path') and os.path.exists(t_meta['img_path'])
+    )
+
+    if has_raw:
+        tmc_crop = load_pds4_window(t_meta['img_path'], tr[0], tr[1], tr[2], tr[3], t_meta['samples'], t_meta['dtype'], offset=t_meta.get('offset',0))
+        ohrc_raw = load_pds4_decimated(o_meta['img_path'], oroi[0], oroi[1], oroi[2], oroi[3], o_meta['samples'], o_meta['dtype'], step, offset=o_meta.get('offset',0))
+        print("[PIPELINE] 3. GSD Normalization via Scale-Space Pyramid...")
+        target_w = max(32, int(round(ohrc_raw.shape[1] * o_meta['gsd'] / t_meta['gsd'])))
+        target_h = max(32, int(round(ohrc_raw.shape[0] * step * o_meta['gsd'] / t_meta['gsd'])))
+        factor = float(t_meta['gsd']) / float(o_meta['gsd'] * step)
+        ohrc_crop = scale_space_downsample(ohrc_raw, scale_factor=factor)
+        if ohrc_crop.shape[1] != target_w or ohrc_crop.shape[0] != target_h:
+            ohrc_crop = cv2.resize(ohrc_crop, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    else:
+        p_tmc = os.path.join(ROOT, "results_demo", "tmc_crop.png")
+        p_ohrc = os.path.join(ROOT, "results_demo", "ohrc_crop.png")
+        if os.path.exists(p_tmc) and os.path.exists(p_ohrc):
+            tmc_crop = cv2.imread(p_tmc, cv2.IMREAD_GRAYSCALE)
+            ohrc_crop = cv2.imread(p_ohrc, cv2.IMREAD_GRAYSCALE)
+            ohrc_raw = ohrc_crop.copy()
+        else:
+            raise FileNotFoundError(f"PDS4 raw images ({o_meta.get('img_path')}, {t_meta.get('img_path')}) and results_demo crops are missing.")
     print(f"[PIPELINE] Physical scale: TMC crop {tmc_crop.shape}, OHRC normalized {ohrc_crop.shape}")
     
     print("[PIPELINE] 4. Coarse alignment...")
@@ -1393,7 +1406,14 @@ def run_pipeline(ohrc_xml, tmc_xml, matchers=None, preprocessing='phase_congruen
     out_res['matches_img'] = draw_matches(ohrc_prep, tmc_prep, best_res['points0'], best_res['points1'], best_res['mask'], f"{best_matcher} Matches")
     out_res['checkerboard'] = draw_checkerboard(tmc_crop, ohrc_final)
     out_res['false_color'] = draw_false_color(tmc_crop, ohrc_final)
-    
+    out_res['ohrc_raw'] = ohrc_raw
+    out_res['ohrc_crop'] = ohrc_crop
+    out_res['tmc_crop'] = tmc_crop
+    out_res['target_img'] = ohrc_crop
+    out_res['reference_img'] = tmc_crop
+    out_res['ohrc_meta'] = o_meta
+    out_res['tmc_meta'] = t_meta
+
     return out_res
 
 # =============================================================================
