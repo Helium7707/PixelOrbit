@@ -13,4 +13,4 @@ kornia>=0.7.0
 timm>=0.9.0
 einops>=0.7.0
 romatch>=0.1.2
-lightglue>=0.0
+git+[https://github.com/cvg/LightGlue.git](https://github.com/cvg/LightGlue.git)
