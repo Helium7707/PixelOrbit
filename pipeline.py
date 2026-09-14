@@ -638,9 +638,11 @@ def _empty_matches():
             "H": None, "score": 0.0}
 
 def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device("cpu")
 
 def run_loftr_branch(img0, img1) -> dict:
     try:
@@ -803,8 +805,8 @@ def run_lightglue_branch(img0, img1, device=None, max_keypoints=2048) -> dict:
     try:
         from lightglue import LightGlue, DISK
         from lightglue.utils import rbd
-        # Run on CPU to avoid MPS aten::kthvalue op limitation
-        dev = device or torch.device("cpu")
+        # Use CUDA if available; fall back to CPU (avoids MPS aten::kthvalue op limitation on Mac)
+        dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         def to_tensor(img):
             rgb = np.stack([img]*3, axis=0).astype(np.float32) / 255.0

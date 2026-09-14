@@ -11,8 +11,17 @@ pinned: false
 
 # 🌓 PixelOrbit — Chandrayaan-2 Cross-Sensor Lunar Image Registration
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Helium7707/PixelOrbit/blob/main/PixelOrbit_Colab.ipynb)
+
 > **SIH 2026 | Problem Statement PS 26166**
 > Hybrid multi-modal correspondence between OHRC (0.20 m/px) and TMC-2 (6.13 m/px) imagery from Chandrayaan-2.
+
+## 🚀 Instant Run on Google Colab (Free Nvidia T4 GPU · 16 GB VRAM)
+
+Click the **Open in Colab** badge above or open [`PixelOrbit_Colab.ipynb`](PixelOrbit_Colab.ipynb) in Google Colab:
+1. Enable GPU via **Runtime > Change runtime type > T4 GPU**.
+2. Run all cells (`Ctrl+F9` or `Cmd+F9`).
+3. Click the generated **Cloudflare Tunnel URL** to launch the interactive prototype with full hardware acceleration for all neural models (RoMa DINOv2, LoFTR, LightGlue).
 
 ## Architecture
 
