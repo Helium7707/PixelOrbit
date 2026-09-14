@@ -1029,24 +1029,66 @@ def draw_matches(img0, img1, pts0, pts1, mask, title='') -> np.ndarray:
         cv2.putText(out, title, (16, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 229, 255), 1, cv2.LINE_AA)
     return out
 
-def draw_checkerboard(img_ref, img_registered, tiles=8) -> np.ndarray:
-    r_u8 = normalize_percentile(img_ref)
-    reg_u8 = normalize_percentile(img_registered)
-    h, w = r_u8.shape
+def draw_checkerboard(img_ref, img_registered, tiles=8, tile_size=None) -> np.ndarray:
+    """Creates a seamless 2D interlocking checkerboard comparison overlay.
+    
+    Guarantees strictly square tiles (tile_size x tile_size px) across arbitrary
+    swath aspect ratios (including elongated pushbroom strips). Alternates
+    reference and registered imagery in both horizontal and vertical directions
+    so sub-pixel crater rim continuity can be rigorously inspected along both axes.
+    Preserves uint8 radiometric calibration without re-stretching contrast.
+    """
+    if img_ref.ndim == 3:
+        r_u8 = cv2.cvtColor(img_ref, cv2.COLOR_RGB2GRAY) if img_ref.shape[2] == 3 else img_ref[:, :, 0]
+    else:
+        r_u8 = img_ref
+    if r_u8.dtype != np.uint8 or r_u8.max() <= 1:
+        r_u8 = normalize_percentile(r_u8)
+
+    if img_registered.ndim == 3:
+        reg_u8 = cv2.cvtColor(img_registered, cv2.COLOR_RGB2GRAY) if img_registered.shape[2] == 3 else img_registered[:, :, 0]
+    else:
+        reg_u8 = img_registered
+    if reg_u8.dtype != np.uint8 or reg_u8.max() <= 1:
+        reg_u8 = normalize_percentile(reg_u8)
+
+    h, w = r_u8.shape[:2]
+    if reg_u8.shape[:2] != (h, w):
+        reg_u8 = cv2.resize(reg_u8, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    if tile_size is None or tile_size <= 0:
+        base_dim = min(h, w) if min(h, w) > 0 else max(h, w)
+        tile_size = max(8, int(round(base_dim / max(1, tiles))))
+
     out = np.zeros((h, w), dtype=np.uint8)
-    tile_h, tile_w = h // tiles, w // tiles
-    for i in range(tiles):
-        for j in range(tiles):
-            r1, r2 = i*tile_h, (i+1)*tile_h if i<tiles-1 else h
-            c1, c2 = j*tile_w, (j+1)*tile_w if j<tiles-1 else w
-            if (i+j) % 2 == 0: out[r1:r2, c1:c2] = r_u8[r1:r2, c1:c2]
-            else: out[r1:r2, c1:c2] = reg_u8[r1:r2, c1:c2]
+    n_rows = int(np.ceil(h / tile_size))
+    n_cols = int(np.ceil(w / tile_size))
+
+    for i in range(n_rows):
+        r1 = i * tile_size
+        r2 = min(h, (i + 1) * tile_size)
+        for j in range(n_cols):
+            c1 = j * tile_size
+            c2 = min(w, (j + 1) * tile_size)
+            if (i + j) % 2 == 0:
+                out[r1:r2, c1:c2] = r_u8[r1:r2, c1:c2]
+            else:
+                out[r1:r2, c1:c2] = reg_u8[r1:r2, c1:c2]
     return out
 
 def draw_false_color(img_ref, img_registered) -> np.ndarray:
-    r_u8 = normalize_percentile(img_ref)
-    reg_u8 = normalize_percentile(img_registered)
-    out = np.zeros((r_u8.shape[0], r_u8.shape[1], 3), dtype=np.uint8)
+    if img_ref.dtype == np.uint8 and img_ref.max() > 1:
+        r_u8 = img_ref
+    else:
+        r_u8 = normalize_percentile(img_ref)
+    if img_registered.dtype == np.uint8 and img_registered.max() > 1:
+        reg_u8 = img_registered
+    else:
+        reg_u8 = normalize_percentile(img_registered)
+    h, w = r_u8.shape[:2]
+    if reg_u8.shape[:2] != (h, w):
+        reg_u8 = cv2.resize(reg_u8, (w, h), interpolation=cv2.INTER_LINEAR)
+    out = np.zeros((h, w, 3), dtype=np.uint8)
     out[:, :, 0] = r_u8 # B
     out[:, :, 1] = reg_u8 # G
     out[:, :, 2] = r_u8 # R

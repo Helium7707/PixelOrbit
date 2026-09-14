@@ -1673,7 +1673,7 @@ elif sel == "Alignment Inspection":
                 st.markdown('<div style="font-size:0.75rem;color:#4e5f72;padding-top:8px;">Drag the center handle to reveal Reference vs Registered imagery. Gray neutral tone = sub-pixel alignment. Red/green fringes = residual parallax.</div>',
                             unsafe_allow_html=True)
             elif "Checkerboard" in mode:
-                tiles = st.slider("Grid Frequency", 2, 20, 8, label_visibility="collapsed")
+                tiles = st.slider("Grid Frequency", 2, 24, 8, label_visibility="collapsed", help="Tile divisions across swath width (generates strictly isotropic 1:1 square tiles)")
             else:
                 st.markdown('<div style="font-size:0.75rem;color:#4e5f72;padding-top:8px;">R=Reference · G=Registered · B=Reference. Neutral gray = perfect alignment.</div>',
                             unsafe_allow_html=True)
@@ -2040,7 +2040,17 @@ elif sel == "Alignment Inspection":
                 components.html(sh, height=820)
             elif "Checkerboard" in mode:
                 chk = draw_checkerboard(ref_m, safe_target_component, tiles)
-                fig_chk = render_interactive_image(to_uint8(chk), f"CHECKERBOARD · {tiles}×{tiles} GRID (SCROLL TO ZOOM · DRAG TO PAN)", height=view_height, lock_aspect=is_lock_aspect)
+                h_c, w_c = ref_m.shape[:2]
+                base_dim = min(h_c, w_c) if min(h_c, w_c) > 0 else max(h_c, w_c)
+                tile_sz = max(8, int(round(base_dim / max(1, tiles))))
+                nc = int(np.ceil(w_c / tile_sz))
+                nr = int(np.ceil(h_c / tile_sz))
+                fig_chk = render_interactive_image(
+                    to_uint8(chk),
+                    f"CHECKERBOARD · {nc}×{nr} SQUARE TILES ({tile_sz}×{tile_sz} px) · SCROLL TO ZOOM · DRAG TO PAN",
+                    height=view_height,
+                    lock_aspect=is_lock_aspect
+                )
                 st.plotly_chart(fig_chk, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
             else:
                 fc = draw_false_color(ref_m, safe_target_component)
