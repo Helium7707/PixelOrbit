@@ -15,8 +15,39 @@ import plotly.graph_objects as go
 import plotly.express as px
 from scipy.ndimage import gaussian_filter
 
+def is_streamlit_cloud() -> bool:
+    """Detect if running inside Streamlit Community Cloud container (strict 1GB RAM limit)."""
+    if os.path.exists("/mount/src") or os.environ.get("USER") == "appuser" or os.environ.get("HOME") == "/home/appuser":
+        return True
+    for k, v in os.environ.items():
+        if "STREAMLIT" in k and any(x in k for x in ("SHARING", "CLOUD", "HOST")):
+            return True
+        if "streamlit.app" in str(v).lower():
+            return True
+    return False
+
 def get_system_ram_gb() -> float:
-    """Safely return total system RAM in GB using standard library os or psutil."""
+    """Safely return container-aware RAM in GB."""
+    if is_streamlit_cloud():
+        return 1.0  # Streamlit Community Cloud enforces a strict 1.0 GB cgroup memory limit
+    # Check cgroup v2
+    try:
+        if os.path.exists("/sys/fs/cgroup/memory.max"):
+            with open("/sys/fs/cgroup/memory.max", "r") as f:
+                val = f.read().strip()
+                if val != "max":
+                    return float(val) / (1024**3)
+    except Exception:
+        pass
+    # Check cgroup v1
+    try:
+        if os.path.exists("/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r") as f:
+                val = float(f.read().strip())
+                if val < 1099511627776:
+                    return val / (1024**3)
+    except Exception:
+        pass
     try:
         import psutil
         return float(psutil.virtual_memory().total / (1024**3))
@@ -26,14 +57,7 @@ def get_system_ram_gb() -> float:
         return float((os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')) / (1024**3))
     except Exception:
         pass
-    try:
-        with open('/proc/meminfo', 'r') as f:
-            for line in f:
-                if 'MemTotal' in line:
-                    return float(line.split()[1]) / (1024**2)
-    except Exception:
-        pass
-    return 1.0
+    return 16.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG

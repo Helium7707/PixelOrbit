@@ -23,6 +23,48 @@ import algorithms
 # CONSTANTS & CONFIGURATION
 # =============================================================================
 
+def is_streamlit_cloud() -> bool:
+    """Detect if running inside Streamlit Community Cloud container (strict 1GB RAM limit)."""
+    if os.path.exists("/mount/src") or os.environ.get("USER") == "appuser" or os.environ.get("HOME") == "/home/appuser":
+        return True
+    for k, v in os.environ.items():
+        if "STREAMLIT" in k and any(x in k for x in ("SHARING", "CLOUD", "HOST")):
+            return True
+        if "streamlit.app" in str(v).lower():
+            return True
+    return False
+
+def get_system_ram_gb() -> float:
+    """Safely return container-aware RAM in GB."""
+    if is_streamlit_cloud():
+        return 1.0
+    try:
+        if os.path.exists("/sys/fs/cgroup/memory.max"):
+            with open("/sys/fs/cgroup/memory.max", "r") as f:
+                val = f.read().strip()
+                if val != "max":
+                    return float(val) / (1024**3)
+    except Exception:
+        pass
+    try:
+        if os.path.exists("/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r") as f:
+                val = float(f.read().strip())
+                if val < 1099511627776:
+                    return val / (1024**3)
+    except Exception:
+        pass
+    try:
+        import psutil
+        return float(psutil.virtual_memory().total / (1024**3))
+    except Exception:
+        pass
+    try:
+        return float((os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')) / (1024**3))
+    except Exception:
+        pass
+    return 16.0
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 R_MOON = 1737400.0
 
@@ -662,6 +704,13 @@ def run_loftr_branch(img0, img1) -> dict:
 
 def run_roma_branch(img0, img1, device=None, num_samples=5000) -> dict:
     try:
+        # Check system RAM before attempting to load 1.55 GB RoMa + DINOv2 weights.
+        # Streamlit Community Cloud enforces a 1.0 GB cgroup memory limit which triggers an instant SIGKILL.
+        ram_gb = get_system_ram_gb()
+        if ram_gb < 3.5 and not (device == "cuda" or (torch.cuda.is_available() and device != "cpu")):
+            print(f"[RoMa] Memory constrained container ({ram_gb:.1f}GB RAM, no CUDA GPU). Safely falling back to SIFT.")
+            return run_sift_branch(img0, img1)
+
         from romatch import roma_outdoor
         import tempfile
         print("\n[RoMa] Running certainty-guided dense matching...")
