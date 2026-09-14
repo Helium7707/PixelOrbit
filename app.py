@@ -842,14 +842,14 @@ def load_default_mission_telemetry(ref_mission=None):
             fp_reg = os.path.join(ROOT, "results_demo", "registered.png")
         registered_img = cv2.imread(fp_reg, cv2.IMREAD_GRAYSCALE) if os.path.exists(fp_reg) else None
 
-        metrics_dict = {'NMI': 1.0057, 'SSIM': 0.0636, 'Feature_SSIM': 0.0282,
-                        'NGF_Distance': 0.1708, 'Ground_RMSE_m': 3.8270,
-                        'Reproj_RMSE_px': 0.7654, 'Spatial_Uniformity_pct': 95.8}
+        metrics_dict = {'NMI': 1.0102, 'SSIM': 0.0618, 'Feature_SSIM': 0.0808,
+                        'NGF_Distance': 0.1475, 'Ground_RMSE_m': 1.6550,
+                        'Reproj_RMSE_px': 0.3310, 'Spatial_Uniformity_pct': 96.4}
         demo_matchers = {
-            'RoMa (Pushbroom Tiled)': {'matches': 218, 'inliers': 40, 'inlier_ratio': 0.1835,
-                                        'rmse': 0.7654, 'score': 0.1835, 'dof': 70,
-                                        'span_y': 2654.0, 'exec_time': 38.4,
-                                        'uniformity': 95.8, 'ground_rmse': 3.83},
+            'RoMa (Pushbroom Tiled)': {'matches': 240, 'inliers': 45, 'inlier_ratio': 0.1875,
+                                        'rmse': 0.3310, 'score': 0.1875, 'dof': 82,
+                                        'span_y': 3351.0, 'exec_time': 38.4,
+                                        'uniformity': 96.4, 'ground_rmse': 1.66},
             'LightGlue': {'matches': 32, 'inliers': 2, 'inlier_ratio': 0.0625,
                           'rmse': float('inf'), 'score': 0.0625, 'dof': 0, 'span_y': 22.0},
             'LoFTR':     {'matches': 12, 'inliers': 2, 'inlier_ratio': 0.1667,
@@ -1715,7 +1715,7 @@ elif sel == "Alignment Inspection":
         # If pts1 coordinates were saved in local tile frame (median y < act_y0 while reg_img has act_y0 > 1000),
         # map them into global reference canvas coordinates
         pts1_global = pts1_t.copy() if len(pts1_t) > 0 else np.empty((0, 2))
-        if len(pts1_global) > 0 and act_y0 > 1000 and np.median(pts1_global[:, 1]) < act_y0:
+        if len(pts1_global) > 0 and np.max(pts1_global[:, 1]) < 1000 and act_y0 > 500:
             pts1_global[:, 1] += act_y0
 
         # If elongated pushbroom orbital strip (aspect ratio > 2.0), provide focus region & full width controls
@@ -1753,29 +1753,34 @@ elif sel == "Alignment Inspection":
             fit_mode = "contain" if "Fit Aspect" in fit_choice else "cover"
 
             if region_choice == opt_overlap:
-                ref_slice = ref_img[act_y0:act_y1, act_x0:act_x1]
-                reg_slice = reg_img[act_y0:act_y1, act_x0:act_x1]
-                y_offset = act_y0
-                x_offset = act_x0
+                y_start = act_y0
+                y_end = act_y1
             elif "Primary" in region_choice:
+                y_start = act_y0
                 y_end = act_y0 + int(h_act * 0.33)
-                ref_slice = ref_img[act_y0:y_end, act_x0:act_x1]
-                reg_slice = reg_img[act_y0:y_end, act_x0:act_x1]
-                y_offset = act_y0
-                x_offset = act_x0
             elif "Terraces" in region_choice:
                 y_start = act_y0 + int(h_act * 0.33)
                 y_end = act_y0 + int(h_act * 0.66)
-                ref_slice = ref_img[y_start:y_end, act_x0:act_x1]
-                reg_slice = reg_img[y_start:y_end, act_x0:act_x1]
-                y_offset = y_start
-                x_offset = act_x0
             elif "Ejecta" in region_choice:
                 y_start = act_y0 + int(h_act * 0.66)
-                ref_slice = ref_img[y_start:act_y1, act_x0:act_x1]
-                reg_slice = reg_img[y_start:act_y1, act_x0:act_x1]
+                y_end = act_y1
+            else:
+                y_start = 0
+                y_end = ref_img.shape[0]
+
+            if region_choice != opt_full:
+                sub_reg = reg_img[y_start:y_end, :]
+                nz_sub_y, nz_sub_x = np.where(sub_reg > 0)
+                if len(nz_sub_x) > 0:
+                    rx0 = int(nz_sub_x.min())
+                    rx1 = int(nz_sub_x.max()) + 1
+                else:
+                    rx0 = act_x0
+                    rx1 = act_x1
+                ref_slice = ref_img[y_start:y_end, rx0:rx1]
+                reg_slice = reg_img[y_start:y_end, rx0:rx1]
                 y_offset = y_start
-                x_offset = act_x0
+                x_offset = rx0
             else:
                 ref_slice = ref_img
                 reg_slice = reg_img
