@@ -177,13 +177,39 @@ try:
         lunar_lambert_photoclinometry,
         refine_subpixel_corners, refine_homography_subpixel,
         spatial_grid_bucketing, compute_spatial_uniformity_score,
-        match_histograms
+        match_histograms, is_physically_valid_homography
     )
     PIPELINE_AVAILABLE = True
 except ImportError as e:
     PIPELINE_AVAILABLE = False
     SENSOR_SPECS = {}
     st.error(f"Core module import failed: {e}")
+
+def compute_safe_homography(pts0: np.ndarray, pts1: np.ndarray, shape_src: Tuple[int, int], threshold: float = 1.5) -> Tuple[Optional[np.ndarray], np.ndarray]:
+    """Compute homography using USAC_MAGSAC with strict 1.5px threshold and physical sanity validation."""
+    if len(pts0) < 4 or len(pts1) < 4:
+        return None, np.zeros(len(pts0), dtype=bool)
+    try:
+        H, mask = cv2.findHomography(pts0, pts1, cv2.USAC_MAGSAC, threshold)
+    except Exception:
+        H, mask = cv2.findHomography(pts0, pts1, cv2.RANSAC, threshold)
+    if mask is None or H is None:
+        return None, np.zeros(len(pts0), dtype=bool)
+    m = mask.ravel().astype(bool)
+    if np.sum(m) < 4:
+        return None, m
+    valid, reason = is_physically_valid_homography(H, shape_src)
+    if not valid:
+        print(f"[HOMOGRAPHY] Rejected physically impossible homography: {reason}. Attempting partial affine...")
+        M, aff_mask = cv2.estimateAffinePartial2D(pts0, pts1, method=cv2.RANSAC, ransacReprojThreshold=min(threshold, 2.0))
+        if M is not None and aff_mask is not None and np.sum(aff_mask) >= 3:
+            H_aff = np.eye(3)
+            H_aff[:2, :] = M
+            val_aff, _ = is_physically_valid_homography(H_aff, shape_src)
+            if val_aff:
+                return H_aff, aff_mask.ravel().astype(bool)
+        return None, np.zeros(len(pts0), dtype=bool)
+    return H, m
 
 def generate_geotiff_bytes(img: np.ndarray, gsd: float = 5.0, origin_lat: float = 0.0, origin_lon: float = 0.0) -> bytes:
     """Generate in-memory GeoTIFF with IAU 2000 Moon CRS / ModelPixelScale tags."""
@@ -934,7 +960,7 @@ def load_default_mission_telemetry(ref_mission=None):
 
         # Always calculate projective sub-pixel homography from verified inliers if H_mat is missing or identity
         if (H_mat is None or np.allclose(H_mat, np.eye(3))) and len(pts0_t) >= 4 and len(pts1_t) >= 4:
-            H_calc, _ = cv2.findHomography(pts0_t, pts1_t, cv2.RANSAC, 3.0)
+            H_calc, _ = compute_safe_homography(pts0_t, pts1_t, shape_src=tmc_crop.shape[:2], threshold=1.5)
             if H_calc is not None:
                 H_mat = H_calc
 
@@ -1261,7 +1287,7 @@ if sel == "Mission Control":
                             p1 = td['pts1'].copy()
                             H_mat = td.get('H', None)
                             if H_mat is None or np.allclose(H_mat, np.eye(3)):
-                                H_mat, _ = cv2.findHomography(p0, p1, cv2.RANSAC, 3.0)
+                                H_mat, _ = compute_safe_homography(p0, p1, shape_src=ohrc_c.shape[:2], threshold=1.5)
                             is_fallback_telemetry = True
                             res_r = {
                                 'matches': 240, 'inliers': 45, 'inlier_ratio': 0.1875,
@@ -1274,13 +1300,13 @@ if sel == "Mission Control":
                     p1_sub = refine_subpixel_corners(tmc_crop, p1, win_size=(5, 5)) if len(p1) > 0 else p1
                     p0_sub = refine_subpixel_corners(ohrc_c, p0, win_size=(5, 5)) if len(p0) > 0 else p0
                     if H_mat is None and len(p0_sub) >= 4:
-                        sub_res = refine_homography_subpixel(p0_sub, p1_sub, threshold=1.45, loss="huber")
+                        sub_res = refine_homography_subpixel(p0_sub, p1_sub, threshold=1.0, loss="huber", shape_src=ohrc_c.shape[:2])
                         if sub_res.get("H") is not None and sub_res.get("inliers", 0) >= 4:
                             H_mat = sub_res["H"]
                             p0_sub = p0_sub[sub_res["mask"]]
                             p1_sub = p1_sub[sub_res["mask"]]
                         else:
-                            H_mat, _ = cv2.findHomography(p0_sub, p1_sub, cv2.RANSAC, 3.0)
+                            H_mat, _ = compute_safe_homography(p0_sub, p1_sub, shape_src=ohrc_c.shape[:2], threshold=1.5)
 
                     # Use verified pre-registered deliverable if mission fallback was used
                     fp_demo_reg = os.path.join(ROOT, "results_demo", "registered.png")
@@ -1648,64 +1674,41 @@ elif sel == "Verification Studio":
                             except Exception:
                                 pass
 
-                        # If still < 4 inliers and this is the Chandrayaan-2 mission pair,
-                        # deploy verified telemetry (just like Mission Control)
-                        is_mission_pair = (
-                            st.session_state.get('is_mission_pair', False) or
-                            (ref_img.shape[0] > 2000 and target_img.shape[0] > 2000) or
-                            (abs(ref_img.shape[0] - 5533) < 100 and abs(ref_img.shape[1] - 666) < 100)
-                        )
+                        # Compute robust Sub-Pixel Homography with strict geometric sanity checks
                         H_cust = None
-                        if n_in < 4 and is_mission_pair:
-                            tp = os.path.join(ROOT, "results_demo", "roma_telemetry.npz")
-                            if not os.path.exists(tp):
-                                tp = os.path.join(ROOT, "results", "roma_telemetry.npz")
-                            if os.path.exists(tp):
-                                td = np.load(tp)
-                                pt0 = td['pts0'].copy()
-                                pt1 = td['pts1'].copy()
-                                mask = np.ones(len(pt0), dtype=bool)
-                                n_in = len(pt0)
-                                H_cust = td.get('H', None)
-                                if H_cust is None or np.allclose(H_cust, np.eye(3)):
-                                    H_cust, _ = cv2.findHomography(pt0, pt1, cv2.RANSAC, 3.0)
-                                res_m = {
-                                    'matches': 240, 'inliers': 45, 'inlier_ratio': 0.1875,
-                                    'rmse': 0.3310, 'score': 0.1875, 'dof': 82,
-                                    'span_y': 3351.0, 'exec_time': round(time.time() - t0, 1),
-                                    'uniformity': 96.4, 'ground_rmse': 1.66,
-                                    'points0': pt0, 'points1': pt1, 'mask': mask
-                                }
-
-                        # Compute robust Sub-Pixel Homography via cv2.findHomography + Levenberg-Marquardt
                         p0_sub, p1_sub = np.empty((0, 2)), np.empty((0, 2))
                         p0_in, p1_in = np.empty((0, 2)), np.empty((0, 2))
+
                         if n_in >= 4:
                             p0_in = pt0[mask].copy()
                             p1_in = pt1[mask].copy()
                             p1_sub = refine_subpixel_corners(ref_img, p1_in, win_size=(5, 5))
                             p0_sub = refine_subpixel_corners(tgt_c, p0_in, win_size=(5, 5))
-                            if H_cust is None:
-                                sub_res = refine_homography_subpixel(p0_sub, p1_sub, threshold=1.45, loss="huber")
-                                if sub_res.get("H") is not None and sub_res.get("inliers", 0) >= 4:
-                                    H_cust = sub_res["H"]
-                                    p0_in = p0_sub[sub_res["mask"]]
-                                    p1_in = p1_sub[sub_res["mask"]]
+
+                            sub_res = refine_homography_subpixel(p0_sub, p1_sub, threshold=1.0, loss="huber", shape_src=tgt_c.shape[:2])
+                            if sub_res.get("H") is not None and sub_res.get("inliers", 0) >= 4:
+                                H_cust = sub_res["H"]
+                                p0_in = p0_sub[sub_res["mask"]]
+                                p1_in = p1_sub[sub_res["mask"]]
+                                n_in = len(p0_in)
+                            else:
+                                H_cust, mask_safe = compute_safe_homography(p0_sub, p1_sub, shape_src=tgt_c.shape[:2], threshold=1.5)
+                                if H_cust is not None and np.sum(mask_safe) >= 4:
+                                    p0_in = p0_sub[mask_safe]
+                                    p1_in = p1_sub[mask_safe]
                                     n_in = len(p0_in)
                                 else:
-                                    H_cust, _ = cv2.findHomography(p0_sub, p1_sub, cv2.RANSAC, 3.0)
-                                    p0_in = p0_sub
-                                    p1_in = p1_sub
+                                    H_cust = None
+                                    n_in = 0
                             p0_sub = p0_in
                             p1_sub = p1_in
-                            # Strictly warp target onto reference coordinate canvas
-                            if H_cust is not None:
-                                warped_custom = cv2.warpPerspective(tgt_c, H_cust, (ref_img.shape[1], ref_img.shape[0]))
-                                warped_custom = match_histograms(warped_custom, ref_img, mask=(warped_custom > 0))
-                            else:
-                                warped_custom = tgt_c
+
+                        if H_cust is not None and n_in >= 4:
+                            warped_custom = cv2.warpPerspective(tgt_c, H_cust, (ref_img.shape[1], ref_img.shape[0]))
+                            warped_custom = match_histograms(warped_custom, ref_img, mask=(warped_custom > 0))
                         else:
                             warped_custom = tgt_c
+                            H_cust = None
 
                         al = fit_tps_warp(tgt_c, p0_in, p1_in, ref_img.shape[:2], 4.0) if n_in >= 4 else tgt_c
                         ff = fuse_images(al, ref_img, 4)
@@ -1714,7 +1717,8 @@ elif sel == "Verification Studio":
                         met = compute_all_metrics(ref_img, ff, gsd=ref_gsd, rmse_px=rmse_val, pts_inliers=pts_in)
                         sm = ngf_similarity_map(ref_img, ff)
                         exec_t = time.time() - t0
-                        mi = draw_matches(tgt_c, ref_img, pt0, pt1, mask, f"{cust_matcher} Matches")
+                        m_title = f"{cust_matcher} Matches ({n_in} Inliers)" if n_in >= 4 else f"{cust_matcher} (0 Validated Inliers — Outliers Culled)"
+                        mi = draw_matches(tgt_c, ref_img, pt0, pt1, mask if n_in >= 4 else np.zeros(len(pt0), dtype=bool), m_title)
                         out_dir = os.path.join(ROOT, "results")
                         os.makedirs(out_dir, exist_ok=True)
                         cv2.imwrite(os.path.join(out_dir, "matches.png"), mi)
@@ -1737,12 +1741,11 @@ elif sel == "Verification Studio":
                             'ref_gsd': ref_gsd
                         }
                         sync_telemetry_to_session_state(res_cust)
-                        st.session_state.verification_executed_success = True
-                        if n_in >= 4:
+                        if n_in >= 4 and H_cust is not None:
                             reproj_str = f"{met.get('Reproj_RMSE_px', 0.33):.2f} px"
                             st.success(f"Registration complete — {n_in} validated inliers · {exec_t:.1f}s execution · Reproj RMSE: {reproj_str}")
                         else:
-                            st.warning(f"Registration finished with {n_in} inliers (< 4 threshold) · {exec_t:.1f}s execution. Insufficient inliers to resolve projective homography.")
+                            st.warning(f"Registration finished with {n_in} validated inliers (< 4 threshold or homography failed physical sanity check) · {exec_t:.1f}s execution. Outliers strictly culled to prevent non-physical deformation.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Registration failed: {e}")
@@ -2116,9 +2119,10 @@ elif sel == "Alignment Inspection":
 
         H_mat = res.get('H', st.session_state.get('H_mat', None))
         if (H_mat is None or np.allclose(H_mat, np.eye(3))) and len(pts0_t) >= 4 and len(pts1_t) >= 4:
-            H_mat, _ = cv2.findHomography(pts0_t, pts1_t, cv2.RANSAC, 3.0)
-            res['H'] = H_mat
-            st.session_state.H_mat = H_mat
+            H_mat, _ = compute_safe_homography(pts0_t, pts1_t, shape_src=ref_img.shape[:2], threshold=1.5)
+            if H_mat is not None:
+                res['H'] = H_mat
+                st.session_state.H_mat = H_mat
 
         ic1, ic2 = st.columns([1.6, 2.4])
         with ic1:

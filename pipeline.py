@@ -523,7 +523,10 @@ def prepare_images(
     if mode == 'phase_congruency':
         o_pc = algorithms.phase_congruency_2d(ohrc_norm)
         t_pc = algorithms.phase_congruency_2d(tmc_norm)
-        return (o_pc * 255).astype(np.uint8), (t_pc * 255).astype(np.uint8)
+        # Contrast-enhance phase congruency to preserve local crater topology and rims
+        o_u8 = apply_clahe(normalize_percentile(o_pc), clip_limit=2.5, grid_size=8)
+        t_u8 = apply_clahe(normalize_percentile(t_pc), clip_limit=2.5, grid_size=8)
+        return o_u8, t_u8
     elif mode == 'ngf':
         ox, oy, _ = algorithms.compute_ngf(ohrc_norm)
         tx, ty, _ = algorithms.compute_ngf(tmc_norm)
@@ -754,7 +757,7 @@ def run_loftr_branch(img0, img1, mask0: Optional[np.ndarray] = None, mask1: Opti
             print(f"[LoFTR] Matches after valid-data masking: {len(pts0)} (< 4 required)")
             return _empty_matches()
         
-        res = ransac_homography(pts0, pts1, threshold=5.0, img_ref=img1, img_tgt=img0)
+        res = ransac_homography(pts0, pts1, threshold=1.5, img_ref=img1, img_tgt=img0)
         res['score'] = float(res['inlier_ratio'])
         print(f"[LoFTR] Matches: {res['matches']}, Inliers: {res['inliers']} ({res['inlier_ratio']*100:.1f}%), RMSE: {res['rmse']:.2f}px")
         return res
@@ -763,18 +766,19 @@ def run_loftr_branch(img0, img1, mask0: Optional[np.ndarray] = None, mask1: Opti
         return _empty_matches()
 
 def run_roma_branch(img0, img1, device=None, num_samples=5000,
-                    mask0: Optional[np.ndarray] = None, mask1: Optional[np.ndarray] = None) -> dict:
+                    mask0: Optional[np.ndarray] = None, mask1: Optional[np.ndarray] = None,
+                    min_certainty: float = 0.55) -> dict:
     try:
         # Check system RAM before attempting to load 1.55 GB RoMa + DINOv2 weights.
         ram_gb = get_system_ram_gb()
         if ram_gb < 3.5 and not (device == "cuda" or (torch.cuda.is_available() and device != "cpu")):
             print(f"[RoMa] Memory constrained container ({ram_gb:.1f}GB RAM, no CUDA GPU). Safely falling back to SIFT.")
             return run_sift_branch(img0, img1, mask0=mask0, mask1=mask1)
-
+            
+        print("[RoMa] Loading RoMa (outdoor)...")
         from romatch import roma_outdoor
         import tempfile
-        print("\n[RoMa] Running certainty-guided dense matching with strict data masking...")
-        dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        dev = device or select_device()
         model = roma_outdoor(device=dev)
         for m in model.modules():
             if hasattr(m, "use_custom_corr"):
@@ -800,7 +804,7 @@ def run_roma_branch(img0, img1, device=None, num_samples=5000,
             tile_len = min(750, h0)
             offsets = [0, max(0, (h0 - tile_len) // 2), max(0, h0 - tile_len)]
             offsets = sorted(list(set(offsets)))
-            all_p0, all_p1, all_certs = [], [], []
+            all_p0, all_p1 = [], []
             
             for r0 in offsets:
                 r1 = min(h0, r0 + tile_len)
@@ -827,7 +831,17 @@ def run_roma_branch(img0, img1, device=None, num_samples=5000,
                 p1_np = k1.cpu().numpy()
                 c_np = s_cert.cpu().numpy()
 
-                # Filter sampled matches by local tile valid-data masks
+                # 1. Cull low-confidence feature correlations across flat terrain
+                conf_mask = (c_np >= min_certainty)
+                if np.sum(conf_mask) >= 8:
+                    p0_np, p1_np = p0_np[conf_mask], p1_np[conf_mask]
+                elif len(c_np) > 0:
+                    top_thresh = max(0.35, float(np.percentile(c_np, 70)))
+                    top_mask = (c_np >= top_thresh)
+                    if np.sum(top_mask) >= 4:
+                        p0_np, p1_np = p0_np[top_mask], p1_np[top_mask]
+
+                # 2. Filter sampled matches by local tile valid-data masks
                 p0_np, p1_np = filter_matches_by_mask(
                     p0_np, p1_np, tile_m0, tile_m1, tile_o.shape[0], tile_o.shape[1], tile_t.shape[0], tile_t.shape[1]
                 )
@@ -838,20 +852,22 @@ def run_roma_branch(img0, img1, device=None, num_samples=5000,
                 p0_np[:, 1] += r0
                 p1_np[:, 1] += r0
                 
-                # Adaptive orbital displacement consistency filter:
+                # 3. Median Absolute Deviation (MAD) orbital flow consistency filter
                 disp = p1_np - p0_np
                 disp_norm = np.linalg.norm(disp, axis=1)
-                if len(disp) > 8:
+                if len(disp) >= 8:
                     med_disp = np.median(disp, axis=0)
-                    res_disp = np.linalg.norm(disp - med_disp, axis=1)
-                    valid_disp = (res_disp < 10.0) & (disp_norm < 40.0)
+                    mad = np.median(np.abs(disp - med_disp), axis=0)
+                    mad_tol = np.maximum(mad * 3.0, [4.0, 4.0])
+                    valid_disp = (np.abs(disp[:, 0] - med_disp[0]) <= mad_tol[0]) & \
+                                 (np.abs(disp[:, 1] - med_disp[1]) <= mad_tol[1]) & \
+                                 (disp_norm < 35.0)
                 else:
                     valid_disp = disp_norm < 30.0
                 
                 if np.any(valid_disp):
                     all_p0.append(p0_np[valid_disp])
                     all_p1.append(p1_np[valid_disp])
-                    all_certs.append(c_np[:len(p0_np)][valid_disp])
                     
             if all_p0:
                 pts0 = np.concatenate(all_p0, axis=0)
@@ -868,14 +884,40 @@ def run_roma_branch(img0, img1, device=None, num_samples=5000,
             s_matches, s_cert = model.sample(warp, cert, num=num_samples)
             kpts0, kpts1 = model.to_pixel_coordinates(s_matches, img0.shape[0], img0.shape[1], img1.shape[0], img1.shape[1])
             pts0, pts1 = kpts0.cpu().numpy(), kpts1.cpu().numpy()
+            c_np = s_cert.cpu().numpy()
+
+            # Cull low-confidence matches
+            conf_mask = (c_np >= min_certainty)
+            if np.sum(conf_mask) >= 8:
+                pts0, pts1 = pts0[conf_mask], pts1[conf_mask]
+            elif len(c_np) > 0:
+                top_thresh = max(0.35, float(np.percentile(c_np, 70)))
+                top_mask = (c_np >= top_thresh)
+                if np.sum(top_mask) >= 4:
+                    pts0, pts1 = pts0[top_mask], pts1[top_mask]
 
         # Strict global data mask enforcement
         pts0, pts1 = filter_matches_by_mask(pts0, pts1, mask0, mask1, h0, w0, h1, w1)
         if len(pts0) < 4:
             print(f"[RoMa] Matches after valid-data masking: {len(pts0)} (< 4 required)")
             return _empty_matches()
+
+        # Flow consistency check on global coordinates
+        if len(pts0) >= 8:
+            disp = pts1 - pts0
+            med_disp = np.median(disp, axis=0)
+            mad = np.median(np.abs(disp - med_disp), axis=0)
+            mad_tol = np.maximum(mad * 3.0, [4.0, 4.0])
+            valid_disp = (np.abs(disp[:, 0] - med_disp[0]) <= mad_tol[0]) & \
+                         (np.abs(disp[:, 1] - med_disp[1]) <= mad_tol[1])
+            pts0, pts1 = pts0[valid_disp], pts1[valid_disp]
+
+        if len(pts0) < 4:
+            print(f"[RoMa] Matches after flow consistency: {len(pts0)} (< 4 required)")
+            return _empty_matches()
         
-        res = ransac_homography(pts0, pts1, threshold=4.5, img_ref=img1, img_tgt=img0)
+        # Tightened RANSAC threshold 1.5px with geometric sanity check
+        res = ransac_homography(pts0, pts1, threshold=1.5, img_ref=img1, img_tgt=img0)
         res['score'] = float(res['inlier_ratio'])
         print(f"[RoMa] Matches: {res['matches']}, Inliers: {res['inliers']} ({res['inlier_ratio']*100:.2f}%), RMSE: {res['rmse']:.2f}px")
         return res
@@ -1146,10 +1188,18 @@ def run_cnsfm_branch(img0, img1) -> dict:
 # GEOMETRIC VERIFICATION SECTION
 # =============================================================================
 
-def ransac_homography(pts0, pts1, threshold=5.0, max_iters=5000, img_ref=None, img_tgt=None) -> dict:
+def ransac_homography(pts0, pts1, threshold=1.5, max_iters=5000, img_ref=None, img_tgt=None) -> dict:
     if len(pts0) < 4: return _empty_matches()
 
-    # Stage 1: USAC_MAGSAC for initial candidate inlier set
+    # Determine canvas bounds for physical geometric sanity check
+    if img_tgt is not None:
+        shape_src = img_tgt.shape[:2]
+    else:
+        span_y = max(100.0, float(np.ptp(pts0[:, 1])))
+        span_x = max(100.0, float(np.ptp(pts0[:, 0])))
+        shape_src = (int(span_y * 1.1), int(span_x * 1.1))
+
+    # Stage 1: USAC_MAGSAC for initial candidate inlier set at strict 1.5px threshold
     H, mask = cv2.findHomography(pts0, pts1, cv2.USAC_MAGSAC, threshold, maxIters=max_iters)
     if mask is None: mask = np.zeros(len(pts0), dtype=bool)
     else: mask = mask.ravel().astype(bool)
@@ -1160,11 +1210,12 @@ def ransac_homography(pts0, pts1, threshold=5.0, max_iters=5000, img_ref=None, i
     p1_active = pts1[mask] if inliers > 0 else pts1
     uniformity_info = algorithms.compute_spatial_uniformity_score(p1_active)
 
-    # Check for geometric degeneracy
+    # Rigorous physical geometric sanity check on candidate homography
     if inliers >= 4 and H is not None:
-        det = float(np.linalg.det(H[:2, :2]))
-        if det <= 0.1 or det >= 10.0:
-            return ransac_affine(pts0, pts1, threshold=threshold, max_iters=max_iters)
+        valid_geo, geo_msg = algorithms.is_physically_valid_homography(H, shape_src)
+        if not valid_geo:
+            print(f"[RANSAC] Initial Homography rejected by physical sanity check: {geo_msg}. Attempting constrained affine...")
+            return ransac_affine(pts0, pts1, threshold=min(threshold, 2.0), max_iters=max_iters)
 
         p0_in, p1_in = pts0[mask].copy(), pts1[mask].copy()
 
@@ -1174,9 +1225,9 @@ def ransac_homography(pts0, pts1, threshold=5.0, max_iters=5000, img_ref=None, i
         if img_tgt is not None:
             p0_in = algorithms.refine_subpixel_corners(img_tgt, p0_in, win_size=(5, 5))
 
-        # Stage 2: Sub-pixel Levenberg-Marquardt Huber M-estimator homography optimization
+        # Stage 2: Sub-pixel Levenberg-Marquardt Huber M-estimator homography optimization (< 1.0 px)
         sub_res = algorithms.refine_homography_subpixel(
-            p0_in, p1_in, threshold=min(threshold / 2.0, 1.45), loss="huber"
+            p0_in, p1_in, threshold=min(threshold, 1.0), loss="huber", shape_src=shape_src
         )
         if sub_res.get("H") is not None and sub_res.get("inliers", 0) >= 4:
             H = sub_res["H"]
@@ -1197,8 +1248,13 @@ def ransac_homography(pts0, pts1, threshold=5.0, max_iters=5000, img_ref=None, i
             dof = max(0, int(2 * inliers - 8))
             p0_sub_in = p0_in
             p1_sub_in = p1_in
+            if rmse > 2.0:
+                print(f"[RANSAC] Sub-pixel RMSE ({rmse:.2f}px) exceeds 2.0px threshold. Falling back to affine...")
+                return ransac_affine(pts0, pts1, threshold=min(threshold, 2.0), max_iters=max_iters)
 
         uniformity_info = algorithms.compute_spatial_uniformity_score(pts1[mask] if inliers > 0 else pts1)
+    else:
+        return _empty_matches()
 
     pts0_out = pts0.copy().astype(np.float64)
     pts1_out = pts1.copy().astype(np.float64)
@@ -1224,7 +1280,7 @@ def ransac_homography(pts0, pts1, threshold=5.0, max_iters=5000, img_ref=None, i
     }
 
 
-def ransac_affine(pts0, pts1, threshold=6.0, max_iters=5000) -> dict:
+def ransac_affine(pts0, pts1, threshold=2.0, max_iters=5000) -> dict:
     if len(pts0) < 3: return _empty_matches()
     M, mask = cv2.estimateAffinePartial2D(pts0, pts1, method=cv2.RANSAC, ransacReprojThreshold=threshold, maxIters=max_iters)
     if mask is None: mask = np.zeros(len(pts0), dtype=bool)
@@ -1233,16 +1289,28 @@ def ransac_affine(pts0, pts1, threshold=6.0, max_iters=5000) -> dict:
     inliers = int(np.sum(mask))
     rmse = float("inf")
     if inliers >= 3 and M is not None:
+        # Check physical scale stretch bounds for affine partial 2D
+        sc = float(np.sqrt(M[0, 0]**2 + M[1, 0]**2))
+        if sc < 0.35 or sc > 2.8:
+            print(f"[RANSAC] Affine rejected: extreme scale change ({sc:.2f})")
+            return _empty_matches()
         p0, p1 = pts0[mask], pts1[mask]
         proj = cv2.transform(p0.reshape(-1, 1, 2), M).reshape(-1, 2)
         rmse = float(np.sqrt(np.mean(np.linalg.norm(proj - p1, axis=1)**2)))
+        if rmse > 2.0:
+            print(f"[RANSAC] Affine rejected: RMSE {rmse:.2f}px > 2.0px threshold")
+            return _empty_matches()
+    else:
+        return _empty_matches()
         
     # Return as H for consistency
     H = np.eye(3)
     if M is not None: H[:2, :] = M
     
-    return {"matches": len(pts0), "inliers": inliers, "inlier_ratio": inliers/len(pts0),
-            "rmse": rmse, "points0": pts0, "points1": pts1, "mask": mask, "H": H, "score": 0.0}
+    return {"matches": len(pts0), "inliers": inliers, "inlier_ratio": inliers/len(pts0) if len(pts0) > 0 else 0.0,
+            "rmse": rmse, "points0": pts0, "points1": pts1, "mask": mask, "H": H, "score": 0.0,
+            "subpixel_pts0": pts0[mask] if inliers > 0 else np.empty((0, 2)),
+            "subpixel_pts1": pts1[mask] if inliers > 0 else np.empty((0, 2))}
 
 # =============================================================================
 # NON-RIGID REGISTRATION SECTION

@@ -945,29 +945,118 @@ def refine_subpixel_phase_correlation(
     return pts_ref.copy(), refined_tgt
 
 
+def is_physically_valid_homography(
+    H: np.ndarray,
+    shape_src: Tuple[int, int],
+    shape_dst: Optional[Tuple[int, int]] = None,
+    max_reproj_rmse: float = 2.0,
+) -> Tuple[bool, str]:
+    """Rigorous geometric sanity check on 3x3 homography matrix for lunar orbital sensors.
+
+    Enforces physical observation constraints for near-nadir pushbroom satellite
+    cameras (Chandrayaan-2 TMC-2 / OHRC), discarding degenerate solutions, non-convex
+    projections, extreme perspective keystoning, and non-physical shear distortions.
+
+    Args:
+        H: (3, 3) homography matrix mapping source coordinates to destination coordinates.
+        shape_src: (H, W) of the source image canvas.
+        shape_dst: Optional (H, W) of the destination image canvas.
+        max_reproj_rmse: Maximum acceptable reprojection RMSE in pixels.
+
+    Returns:
+        (is_valid, reason_str): Boolean validity and descriptive diagnostic message.
+    """
+    if H is None or not isinstance(H, np.ndarray) or H.shape != (3, 3):
+        return False, "H is not a valid 3x3 numpy array"
+    if not np.all(np.isfinite(H)):
+        return False, "H contains NaN or infinite coefficients"
+    if abs(H[2, 2]) < 1e-7:
+        return False, "H[2,2] is near-zero; projective matrix is singular"
+
+    H_norm = H / H[2, 2]
+    det_full = float(np.linalg.det(H_norm))
+    if abs(det_full) < 1e-6:
+        return False, f"Singular homography matrix (det={det_full:.2e})"
+
+    h_src, w_src = shape_src[:2]
+    if h_src <= 0 or w_src <= 0:
+        return False, f"Invalid source dimensions: {shape_src}"
+
+    # 1. Affine orientation & area scale bounds
+    det_affine = float(np.linalg.det(H_norm[:2, :2]))
+    if det_affine <= 0.0:
+        return False, f"Inverted orientation (det_affine={det_affine:.4f} <= 0; reflection detected)"
+    if det_affine < 0.20 or det_affine > 5.0:
+        return False, f"Unrealistic area scale factor (det_affine={det_affine:.3f}; allowable [0.20, 5.0])"
+
+    # 2. SVD singular value condition number & shear bounds
+    try:
+        U, S, Vt = np.linalg.svd(H_norm[:2, :2])
+    except Exception as e:
+        return False, f"SVD decomposition failed: {e}"
+
+    cond_num = float(S[0] / max(S[1], 1e-6))
+    if cond_num > 2.5:
+        return False, f"Extreme geometric shear/skew (condition number={cond_num:.2f} > 2.5)"
+    if S[1] < 0.35 or S[0] > 2.8:
+        return False, f"Non-physical singular scale stretch (sigma_min={S[1]:.2f}, sigma_max={S[0]:.2f})"
+
+    # 3. Projective keystoning / tilt bounds
+    keystone = float(abs(H_norm[2, 0]) * w_src + abs(H_norm[2, 1]) * h_src)
+    if keystone > 0.35:
+        return False, f"Extreme perspective keystoning ({keystone:.3f} > 0.35 allowable)"
+
+    # 4. Cheirality (positive projective denominators across all 4 image corners)
+    corners = np.array([
+        [0.0, 0.0],
+        [float(w_src), 0.0],
+        [float(w_src), float(h_src)],
+        [0.0, float(h_src)]
+    ], dtype=np.float32)
+    w_denom = H_norm[2, 0] * corners[:, 0] + H_norm[2, 1] * corners[:, 1] + 1.0
+    if np.any(w_denom <= 0.05):
+        return False, f"Projective horizon singularity (min denominator w={float(np.min(w_denom)):.3f} <= 0.05)"
+
+    # 5. Quadrilateral convexity & positive signed area
+    proj_corners = cv2.perspectiveTransform(corners.reshape(-1, 1, 2), H_norm).reshape(-1, 2)
+    edges = np.roll(proj_corners, -1, axis=0) - proj_corners
+    cross_prods = edges[:, 0] * np.roll(edges[:, 1], -1) - edges[:, 1] * np.roll(edges[:, 0], -1)
+    if not (np.all(cross_prods > 0) or np.all(cross_prods < 0)):
+        return False, "Transformed bounding box is non-convex or self-intersecting"
+
+    quad_area = float(cv2.contourArea(proj_corners.astype(np.float32)))
+    src_area = float(w_src * h_src)
+    if quad_area < 0.20 * src_area or quad_area > 5.0 * src_area:
+        return False, f"Transformed quadrilateral area abnormal ({quad_area:.0f} vs {src_area:.0f} px^2)"
+
+    return True, "Physically valid planar homography"
+
+
 def refine_homography_subpixel(
     pts0: np.ndarray,
     pts1: np.ndarray,
-    threshold: float = 1.45,
+    threshold: float = 1.0,
     loss: str = "huber",
+    shape_src: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, Any]:
     """Non-linear Levenberg-Marquardt homography refinement for sub-pixel accuracy.
 
-    Fits an initial USAC_MAGSAC homography at sub-pixel threshold, then performs
-    M-estimator non-linear least squares minimization (Huber loss) to achieve
-    sub-pixel Reprojection RMSE strictly below 1.0 pixel.
+    Fits an initial USAC_MAGSAC homography at strict sub-pixel threshold (default 1.0 px),
+    then performs M-estimator non-linear least squares minimization (Huber loss) to achieve
+    sub-pixel Reprojection RMSE strictly below 1.0 pixel with geometric validation.
 
     Args:
         pts0: (N, 2) coordinates in target frame.
         pts1: (N, 2) coordinates in reference frame.
-        threshold: Inlier residual threshold in pixels for USAC_MAGSAC.
+        threshold: Inlier residual threshold in pixels for USAC_MAGSAC (default 1.0 px).
         loss: Robust loss function ('huber', 'cauchy', or 'linear').
+        shape_src: Optional (H, W) source image dimensions for physical sanity check.
 
     Returns:
         Dict with keys:
-            'H': (3, 3) optimized homography matrix.
+            'H': (3, 3) optimized homography matrix (or None if invalid).
             'inliers': Number of validated inliers.
-            'rmse': Calculated Reprojection RMSE in pixels (strictly < 1.0 px).
+            'rmse': Calculated Reprojection RMSE in pixels.
             'residuals': (N_inliers, ) per-point reprojection errors.
             'mask': Boolean inlier mask over input pts0.
             'dof': Overdetermined Degrees of Freedom (2*N - 8).
@@ -1020,6 +1109,19 @@ def refine_homography_subpixel(
     residuals = np.linalg.norm(proj - p1_in, axis=1)
     rmse = float(np.sqrt(np.mean(residuals ** 2)))
     dof = max(0, int(2 * len(p0_in) - 8))
+
+    if shape_src is not None:
+        valid_geo, geo_msg = is_physically_valid_homography(H_opt, shape_src)
+        if not valid_geo:
+            return {
+                "H": None,
+                "inliers": 0,
+                "rmse": float("inf"),
+                "residuals": np.array([]),
+                "mask": np.zeros(len(pts0), dtype=bool),
+                "dof": 0,
+                "error": geo_msg,
+            }
 
     return {
         "H": H_opt,
