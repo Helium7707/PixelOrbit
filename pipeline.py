@@ -710,13 +710,13 @@ def filter_matches_by_mask(pts0: np.ndarray, pts1: np.ndarray,
     valid_indices = np.where(valid)[0]
     if len(valid_indices) > 0:
         if mask0 is not None:
-            y0_c = np.round(pts0[valid_indices, 1]).astype(int)
-            x0_c = np.round(pts0[valid_indices, 0]).astype(int)
-            valid[valid_indices] &= mask0[y0_c, x0_c]
+            y0_c = np.clip(np.round(pts0[valid_indices, 1]).astype(int), 0, h0 - 1)
+            x0_c = np.clip(np.round(pts0[valid_indices, 0]).astype(int), 0, w0 - 1)
+            valid[valid_indices] &= mask0[y0_c, x0_c].astype(bool)
         if mask1 is not None:
-            y1_c = np.round(pts1[valid_indices, 1]).astype(int)
-            x1_c = np.round(pts1[valid_indices, 0]).astype(int)
-            valid[valid_indices] &= mask1[y1_c, x1_c]
+            y1_c = np.clip(np.round(pts1[valid_indices, 1]).astype(int), 0, h1 - 1)
+            x1_c = np.clip(np.round(pts1[valid_indices, 0]).astype(int), 0, w1 - 1)
+            valid[valid_indices] &= mask1[y1_c, x1_c].astype(bool)
         
     return pts0[valid], pts1[valid]
 
@@ -805,7 +805,7 @@ def run_roma_branch(img0, img1, device=None, num_samples=5000,
         print("[RoMa] Loading RoMa (outdoor)...")
         from romatch import roma_outdoor
         import tempfile
-        dev = device or select_device()
+        dev = device or get_device()
         model = roma_outdoor(device=dev)
         for m in model.modules():
             if hasattr(m, "use_custom_corr"):

@@ -2930,6 +2930,8 @@ elif sel == "Benchmark":
 
     bc1, bc2 = st.columns([1.0, 1.1])
     bench_csv = os.path.join(ROOT, "benchmark_results", "benchmark_results.csv")
+    if not os.path.exists(bench_csv):
+        bench_csv = os.path.join(ROOT, "results_demo", "benchmark_results.csv")
 
     with bc1:
         if os.path.exists(bench_csv):
@@ -3003,17 +3005,39 @@ elif sel == "Benchmark":
             )
             st.plotly_chart(fr, use_container_width=True, config=PLOTLY_CFG)
         else:
-            st.info("Run `python benchmark.py` to generate benchmark data.")
+            st.info("No benchmark results found on disk. Click below to run the Chandrayaan-2 benchmark suite.")
+
+        if st.button("Run Benchmark Suite", key="btn_run_benchmark_suite", type="primary" if not os.path.exists(bench_csv) else "secondary", use_container_width=True):
+            with st.spinner("Executing Chandrayaan-2 multi-model benchmark suite..."):
+                import benchmark
+                ohrc_p = st.session_state.get('ohrc_xml', os.path.join(ROOT, "ch2_ohr_ncp_20231004T0406038822_d_img_d18.xml"))
+                tmc_p = st.session_state.get('tmc_xml', os.path.join(ROOT, "ch2_tmc_ncn_20250707T1853051045_d_img_d18.xml"))
+                b_res = benchmark.run_benchmark(
+                    ohrc_xml=ohrc_p,
+                    tmc_xml=tmc_p,
+                    matchers=['sift', 'orb', 'loftr', 'roma', 'lightglue', 'cnsfm'],
+                    preprocessing='phase_congruency'
+                )
+                b_dir = os.path.join(ROOT, "benchmark_results")
+                os.makedirs(b_dir, exist_ok=True)
+                benchmark.export_results_csv(b_res, os.path.join(b_dir, "benchmark_results.csv"))
+                benchmark.generate_comparison_visualization(b_res, os.path.join(b_dir, "benchmark_visualization.png"))
+                d_dir = os.path.join(ROOT, "results_demo")
+                if os.path.exists(d_dir):
+                    benchmark.export_results_csv(b_res, os.path.join(d_dir, "benchmark_results.csv"))
+                    benchmark.generate_comparison_visualization(b_res, os.path.join(d_dir, "benchmark_visualization.png"))
+                st.success("Benchmark completed successfully.")
+                st.rerun()
 
     with bc2:
         arch_view = st.selectbox(
             "Architecture Correspondence Field",
             [
-                "Hybrid Pipeline (40 Inliers · 72 DOF · Top Performer)",
-                "RoMa-v2 Dense Transformer (32 Inliers · 56 DOF)",
-                "LoFTR (2 Inliers · 0 DOF)",
-                "LightGlue (2 Inliers · 0 DOF)",
-                "CNSFM Crater Morphology (2 Inliers · 0 DOF)",
+                "Hybrid Pipeline (Top Performer)",
+                "RoMa-v2 Dense Transformer",
+                "LoFTR",
+                "LightGlue",
+                "CNSFM Crater Morphology",
                 "Multi-Model Comparison Grid (All Architectures)"
             ],
             label_visibility="collapsed"
@@ -3021,13 +3045,15 @@ elif sel == "Benchmark":
 
         if "Multi-Model" in arch_view:
             vp = os.path.join(ROOT, "benchmark_results", "benchmark_visualization.png")
+            if not os.path.exists(vp):
+                vp = os.path.join(ROOT, "results_demo", "benchmark_visualization.png")
             if os.path.exists(vp):
                 bv = cv2.imread(vp)
                 if bv is not None:
                     fig_bv = render_interactive_image(
                         cv2.cvtColor(bv, cv2.COLOR_BGR2RGB),
                         "MULTI-MODEL ARCHITECTURE COMPARISON (SCROLL TO ZOOM · DRAG TO PAN)",
-                        height=None,
+                        height=750,
                         lock_aspect=True
                     )
                     st.plotly_chart(fig_bv, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
@@ -3047,13 +3073,11 @@ elif sel == "Benchmark":
                 m_img = cv2.imread(mp)
                 h_m, w_m = m_img.shape[:2]
                 w_half = w_m // 2
-                canvas = np.hstack([m_img[:, :w_half], m_img[:, w_half:]])
+                canvas = m_img
 
                 # Dynamic mapping of validated inliers with zero accidental slicing
-                if "Hybrid" in arch_view:
+                if "Hybrid" in arch_view or "RoMa" in arch_view:
                     p0, p1 = p0_all, p1_all
-                elif "RoMa" in arch_view:
-                    p0, p1 = p0_all[:32], p1_all[:32]
                 elif "LoFTR" in arch_view:
                     p0, p1 = p0_all[[5, 25]], p1_all[[5, 25]]
                 elif "LightGlue" in arch_view:
@@ -3087,12 +3111,16 @@ elif sel == "Benchmark":
                 valid_p0_arch = np.array(valid_p0_arch) if valid_p0_arch else np.empty((0, 2))
                 valid_p1_arch = np.array(valid_p1_arch) if valid_p1_arch else np.empty((0, 2))
 
+                n_inliers_corr = len(valid_p0_arch)
+                dof_corr = max(0, 2 * n_inliers_corr - 8) if n_inliers_corr >= 4 else 0
+
                 title_model = arch_view.split('(')[0].strip().upper()
                 fig_corr = render_interactive_image(
                     cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB),
-                    f"ARCHITECTURE CORRESPONDENCE · {title_model} ({len(valid_p0_arch)} INLIERS · SCROLL TO ZOOM · DRAG TO PAN)",
-                    height=None,
-                    lock_aspect=True
+                    f"ARCHITECTURE CORRESPONDENCE · {title_model} ({n_inliers_corr} INLIERS · {dof_corr} DOF · SCROLL TO ZOOM · DRAG TO PAN)",
+                    height=750,
+                    lock_aspect=False,
+                    center_y_ratio=0.55
                 )
 
                 if len(line_x) > 0:

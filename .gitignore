@@ -16,7 +16,6 @@ __pycache__/
 # Generated output folders & logs
 results/
 results_test/
-benchmark_results/
 wandb/
 .system_generated/
 
