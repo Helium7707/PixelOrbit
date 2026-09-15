@@ -647,12 +647,14 @@ def get_device():
         return torch.device("mps")
     return torch.device("cpu")
 
-def create_valid_data_mask(img: np.ndarray, margin: int = 3, min_val: int = 1) -> np.ndarray:
+def create_valid_data_mask(img: np.ndarray, margin: int = 4, min_val: int = 15) -> np.ndarray:
     """Generate a strict binary mask of valid image data excluding zero/blank padding.
     
-    Applies morphological erosion by `margin` pixels to prevent false matches
-    on the artificial high-contrast transition boundary between valid imagery
-    and null/black space padding.
+    Extracts the main active image body and fills internal crater shadows so that
+    topographical shadow pits are not conflated with blank background padding.
+    Then applies morphological erosion by `margin` pixels along the outer boundary
+    to prevent false matches on the artificial transition edge between valid imagery
+    and null/black space.
     
     Args:
         img: Input 2D or 3D grayscale/RGB array.
@@ -665,31 +667,56 @@ def create_valid_data_mask(img: np.ndarray, margin: int = 3, min_val: int = 1) -
     if img is None:
         return None
     if img.ndim == 3:
-        mask = np.any(img >= min_val, axis=2)
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.shape[2] == 3 else img[:, :, 0]
     else:
-        mask = (img >= min_val)
-    if margin > 0 and np.any(mask):
+        g = img
+    mask = (g >= min_val).astype(np.uint8)
+    if not np.any(mask):
+        return mask.astype(bool)
+        
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
+    if num_labels > 1:
+        largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        main_body = (labels == largest_label).astype(np.uint8)
+        cnts, _ = cv2.findContours(main_body, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        filled = np.zeros_like(main_body)
+        cv2.drawContours(filled, cnts, -1, 1, thickness=-1)
+    else:
+        filled = mask
+
+    if margin > 0 and np.any(filled):
         ksize = 2 * margin + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
-        mask = cv2.erode(mask.astype(np.uint8), kernel).astype(bool)
-    return mask
+        clean_mask = cv2.erode(filled, kernel).astype(bool)
+    else:
+        clean_mask = filled.astype(bool)
+    return clean_mask
 
 def filter_matches_by_mask(pts0: np.ndarray, pts1: np.ndarray,
                            mask0: Optional[np.ndarray], mask1: Optional[np.ndarray],
                            h0: int, w0: int, h1: int, w1: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Filter correspondences to ensure both points fall strictly within valid data masks."""
+    """Filter correspondences to ensure both points fall strictly within valid data masks.
+    
+    Strictly discards any point out of canvas bounds or on null/black non-data space.
+    """
     if len(pts0) == 0 or len(pts1) == 0:
         return np.empty((0, 2)), np.empty((0, 2))
     
-    valid = np.ones(len(pts0), dtype=bool)
-    if mask0 is not None:
-        y0_c = np.clip(np.round(pts0[:, 1]).astype(int), 0, h0 - 1)
-        x0_c = np.clip(np.round(pts0[:, 0]).astype(int), 0, w0 - 1)
-        valid &= mask0[y0_c, x0_c]
-    if mask1 is not None:
-        y1_c = np.clip(np.round(pts1[:, 1]).astype(int), 0, h1 - 1)
-        x1_c = np.clip(np.round(pts1[:, 0]).astype(int), 0, w1 - 1)
-        valid &= mask1[y1_c, x1_c]
+    # Strict bounds checking without clipping
+    in_bounds0 = (pts0[:, 0] >= 0) & (pts0[:, 0] < w0) & (pts0[:, 1] >= 0) & (pts0[:, 1] < h0)
+    in_bounds1 = (pts1[:, 0] >= 0) & (pts1[:, 0] < w1) & (pts1[:, 1] >= 0) & (pts1[:, 1] < h1)
+    valid = in_bounds0 & in_bounds1
+    
+    valid_indices = np.where(valid)[0]
+    if len(valid_indices) > 0:
+        if mask0 is not None:
+            y0_c = np.round(pts0[valid_indices, 1]).astype(int)
+            x0_c = np.round(pts0[valid_indices, 0]).astype(int)
+            valid[valid_indices] &= mask0[y0_c, x0_c]
+        if mask1 is not None:
+            y1_c = np.round(pts1[valid_indices, 1]).astype(int)
+            x1_c = np.round(pts1[valid_indices, 0]).astype(int)
+            valid[valid_indices] &= mask1[y1_c, x1_c]
         
     return pts0[valid], pts1[valid]
 
@@ -1376,30 +1403,55 @@ def compute_all_metrics(img_ref, img_registered, gsd=5.0, rmse_px=None, pts_inli
 # =============================================================================
 
 def draw_matches(img0, img1, pts0, pts1, mask, title='') -> np.ndarray:
-    h1, w1 = img0.shape
-    h2, w2 = img1.shape
+    if img0.ndim == 3:
+        g0 = cv2.cvtColor(img0, cv2.COLOR_BGR2GRAY) if img0.shape[2] == 3 else img0[:, :, 0]
+    else:
+        g0 = img0
+    if img1.ndim == 3:
+        g1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if img1.shape[2] == 3 else img1[:, :, 0]
+    else:
+        g1 = img1
+        
+    h1, w1 = g0.shape[:2]
+    h2, w2 = g1.shape[:2]
     h = max(h1, h2)
     out = np.zeros((h, w1 + w2, 3), dtype=np.uint8)
-    out[:h1, :w1, :] = cv2.cvtColor(normalize_percentile(img0), cv2.COLOR_GRAY2BGR)
-    out[:h2, w1:w1+w2, :] = cv2.cvtColor(normalize_percentile(img1), cv2.COLOR_GRAY2BGR)
+    out[:h1, :w1, :] = cv2.cvtColor(normalize_percentile(g0), cv2.COLOR_GRAY2BGR)
+    out[:h2, w1:w1+w2, :] = cv2.cvtColor(normalize_percentile(g1), cv2.COLOR_GRAY2BGR)
     
     inlier_indices = np.where(mask)[0] if mask is not None else np.array([], dtype=int)
     
+    # Strict valid data masks for both panels: NEVER draw on black background / no-photo space
+    m0_valid = create_valid_data_mask(g0, margin=4, min_val=15)
+    m1_valid = create_valid_data_mask(g1, margin=4, min_val=15)
+    
+    safe_inliers = []
+    for idx in inlier_indices:
+        if idx >= len(pts0) or idx >= len(pts1):
+            continue
+        p0, p1 = pts0[idx], pts1[idx]
+        x0, y0 = int(round(p0[0])), int(round(p0[1]))
+        x1, y1 = int(round(p1[0])), int(round(p1[1]))
+        if (0 <= y0 < h1 and 0 <= x0 < w1 and 0 <= y1 < h2 and 0 <= x1 < w2):
+            if m0_valid[y0, x0] and m1_valid[y1, x1] and (g0[y0, x0] > 15) and (g1[y1, x1] > 15):
+                safe_inliers.append(idx)
+    safe_inliers = np.array(safe_inliers, dtype=int)
+    
     # Subsample inliers evenly across the vertical axis for clean, professional visualization
-    if len(inlier_indices) > 40:
-        y_coords = pts0[inlier_indices, 1]
+    if len(safe_inliers) > 40:
+        y_coords = pts0[safe_inliers, 1]
         sort_order = np.argsort(y_coords)
         step = max(1, len(sort_order) // 40)
-        display_indices = inlier_indices[sort_order[::step]]
+        display_indices = safe_inliers[sort_order[::step]]
     else:
-        display_indices = inlier_indices
+        display_indices = safe_inliers
         
     for idx in display_indices:
         pt1 = (int(round(pts0[idx][0])), int(round(pts0[idx][1])))
         pt2 = (int(round(pts1[idx][0])) + w1, int(round(pts1[idx][1])))
-        cv2.line(out, pt1, pt2, (0, 230, 115), 1, cv2.LINE_AA)
-        cv2.circle(out, pt1, 2, (0, 230, 115), -1, cv2.LINE_AA)
-        cv2.circle(out, pt2, 2, (0, 230, 115), -1, cv2.LINE_AA)
+        cv2.line(out, pt1, pt2, (235, 220, 0), 1, cv2.LINE_AA)
+        cv2.circle(out, pt1, 3, (16, 219, 168), -1, cv2.LINE_AA)
+        cv2.circle(out, pt2, 3, (16, 219, 168), -1, cv2.LINE_AA)
         
     if title:
         # Sleek dark banner at the top
