@@ -1390,15 +1390,15 @@ if sel == "Mission Control":
         )
         lr1, lr2, lr3 = st.columns(3)
         with lr1:
-            if st.button("🔍 Open Alignment Inspection (Checkerboard / Slider)", type="primary", use_container_width=True, key="mc_to_inspect"):
+            if st.button("Open Alignment Inspection (Checkerboard / Slider)", type="primary", use_container_width=True, key="mc_to_inspect"):
                 st.session_state.current_view = "Alignment Inspection"
                 st.rerun()
         with lr2:
-            if st.button("🔗 Inspect Dense Matches & Vectors", type="secondary", use_container_width=True, key="mc_to_match"):
+            if st.button("Inspect Dense Matches & Vectors", type="secondary", use_container_width=True, key="mc_to_match"):
                 st.session_state.current_view = "Dense Matching"
                 st.rerun()
         with lr3:
-            if st.button("🏔️ Launch 3D Terrain Viewer", type="secondary", use_container_width=True, key="mc_to_3d"):
+            if st.button("Launch 3D Terrain Viewer", type="secondary", use_container_width=True, key="mc_to_3d"):
                 st.session_state.current_view = "3D Terrain"
                 st.rerun()
 
@@ -1592,7 +1592,7 @@ elif sel == "Verification Studio":
                                      label_visibility="collapsed")
         with o4:
             st.markdown('<p class="sec-label">&nbsp;</p>', unsafe_allow_html=True)
-            run_btn = st.button("▶  Register & Match Pair", type="primary", use_container_width=True)
+            run_btn = st.button("Register & Match Pair", type="primary", use_container_width=True)
 
         if "Custom" in cust_sensor:
             ref_gsd = float(st.number_input("Custom Reference GSD (m/px)", min_value=0.01, max_value=100.0, value=float(st.session_state.ref_gsd), step=0.5))
@@ -1783,7 +1783,7 @@ elif sel == "Verification Studio":
                 st.markdown(f'<div class="card card-a" style="text-align:center;padding:10px;"><div style="font-size:1.4rem;font-weight:700;color:#f0f4fa;">{v_time:.1f}s</div><div class="sec-label" style="margin:0;">Execution Time</div></div>', unsafe_allow_html=True)
 
             if v_in < 4:
-                st.warning("⚠️ **Mathematical Inlier Constraint**: Less than 4 tie-point inliers were resolved. At least 4 non-collinear correspondences are mathematically required to solve 8-DOF planar projective homography. Sub-pixel RMSE cannot be computed.")
+                st.warning("**Mathematical Inlier Constraint**: Less than 4 tie-point inliers were resolved. At least 4 non-collinear correspondences are mathematically required to solve 8-DOF planar projective homography. Sub-pixel RMSE cannot be computed.")
 
             vr1, vr2 = st.columns(2)
             with vr1:
@@ -1800,15 +1800,15 @@ elif sel == "Verification Studio":
 
             ac1, ac2, ac3 = st.columns(3)
             with ac1:
-                if st.button("🔍 Open in Alignment Inspection (Checkerboard / Slider)", type="primary", use_container_width=True, key="vs_to_ai"):
+                if st.button("Open in Alignment Inspection (Checkerboard / Slider)", type="primary", use_container_width=True, key="vs_to_ai"):
                     st.session_state.current_view = "Alignment Inspection"
                     st.rerun()
             with ac2:
-                if st.button("🔗 View Inlier Geometry (Dense Matching)", type="secondary", use_container_width=True, key="vs_to_dm"):
+                if st.button("View Inlier Geometry (Dense Matching)", type="secondary", use_container_width=True, key="vs_to_dm"):
                     st.session_state.current_view = "Dense Matching"
                     st.rerun()
             with ac3:
-                if st.button("🏔️ Reconstruct 3D Surface (3D Terrain)", type="secondary", use_container_width=True, key="vs_to_3d"):
+                if st.button("Reconstruct 3D Surface (3D Terrain)", type="secondary", use_container_width=True, key="vs_to_3d"):
                     st.session_state.current_view = "3D Terrain"
                     st.rerun()
     else:
